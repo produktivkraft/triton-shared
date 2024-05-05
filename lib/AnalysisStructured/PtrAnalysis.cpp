@@ -664,7 +664,7 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
 
   if (operand.getType().isa<IntegerType>()) {
     OpBuilder::InsertionGuard guard(builder);
-    if (!operand.isa<BlockArgument>() && operand.getDefiningOp()) {
+    if (!isa<BlockArgument>(operand) && operand.getDefiningOp()) {
       builder.setInsertionPointAfter(operand.getDefiningOp());
     }
     auto castOp = builder.create<arith::IndexCastOp>(

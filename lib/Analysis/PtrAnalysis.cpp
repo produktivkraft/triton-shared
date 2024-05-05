@@ -1100,7 +1100,7 @@ void PtrAnalysis::rewriteForOp(
       // TODO:
       //  Passing a block argument pointer directly into a for loop not
       //  supported.
-      assert(!(mappedV.dyn_cast<BlockArgument>() &&
+      assert(!(dyn_cast<BlockArgument>(mappedV) &&
                mappedV.getType().isa<UnrankedMemRefType>()) &&
              "cannot take pointer block argument as init arg for for loop");
       if (auto op = mappedV.getDefiningOp<memref::ReinterpretCastOp>()) {
