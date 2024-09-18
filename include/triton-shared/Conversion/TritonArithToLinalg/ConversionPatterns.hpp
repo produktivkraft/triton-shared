@@ -28,6 +28,7 @@
 #include "llvm/Support/MathExtras.h"
 
 #include <numeric>
+#include <optional>
 #include <type_traits>
 
 using namespace mlir;
@@ -73,10 +74,10 @@ static Value getScalarValue(Value operand, Location loc,
   };
 
   while (true) {
-    if (!operand.getType().dyn_cast<ShapedType>()) {
+    if (!dyn_cast<ShapedType>(operand.getType())) {
       return reconstructScalarValue(operand);
     } else if (auto op = operand.getDefiningOp<arith::ConstantOp>()) {
-      if (auto attr = op.getValue().dyn_cast<DenseElementsAttr>()) {
+      if (auto attr = dyn_cast<DenseElementsAttr>(op.getValue())) {
         if (!attr.isSplat()) {
           InFlightDiagnostic diag = emitError(loc)
                                     << "other value used in masked load "
@@ -113,7 +114,7 @@ static SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n) {
 static Value getTransposedValue(Value source, const Location loc,
                                 ConversionPatternRewriter &rewriter) {
 
-  auto sourceType = source.getType().cast<RankedTensorType>();
+  auto sourceType = cast<RankedTensorType>(source.getType());
   auto sourceRank = sourceType.getRank();
 
   SmallVector<int64_t> perm(sourceRank);
@@ -131,6 +132,22 @@ static Value getTransposedValue(Value source, const Location loc,
           .getResults()[0];
 
   return transpose;
+}
+
+// for IntLike and FloatLike types
+static std::optional<unsigned> getBitWidth(Type a) {
+  if (auto type = dyn_cast<TensorType>(a)) {
+    auto elementType = type.getElementType();
+    if (elementType.isIntOrFloat()) {
+      return type.getElementType().getIntOrFloatBitWidth();
+    }
+    return std::nullopt;
+  }
+
+  if (a.isIntOrFloat())
+    return a.getIntOrFloatBitWidth();
+
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -163,12 +180,12 @@ struct MakeTensorPtrConverter
                              ConversionPatternRewriter &rewriter,
                              Location loc) const {
     for (auto opnd : ops) {
-      if (opnd.getType().isa<IntegerType>()) {
+      if (isa<IntegerType>(opnd.getType())) {
         auto castOp = rewriter.create<arith::IndexCastOp>(
             loc, rewriter.getIndexType(), opnd);
         vec.push_back(castOp.getResult());
       } else {
-        assert(opnd.getType().isa<IndexType>());
+        assert(isa<IndexType>(opnd.getType()));
         vec.push_back(opnd);
       }
     }
@@ -210,8 +227,8 @@ struct MakeTensorPtrConverter
 
     ArrayRef<int64_t> resultShape;
     auto pointerType =
-        op.getResult().getType().cast<mlir::triton::PointerType>();
-    if (auto shapedType = pointerType.getPointeeType().dyn_cast<ShapedType>()) {
+        cast<mlir::triton::PointerType>(op.getResult().getType());
+    if (auto shapedType = dyn_cast<ShapedType>(pointerType.getPointeeType())) {
       resultShape = shapedType.getShape();
       for (auto dim_size : resultShape) {
         pointerState.sizes.push_back(
@@ -328,7 +345,7 @@ public:
     auto loc = op.getLoc();
 
     // 0. Shortcut for scalar loads
-    if (!op.getResult().getType().isa<ShapedType>()) {
+    if (!isa<ShapedType>(op.getResult().getType())) {
       auto sMemRef = PtrAnalysis::getScalarMemRef(op.getPtr(), adaptor.getPtr(),
                                                   loc, rewriter);
       auto zeroMap = AffineMap::getConstantMap(0, rewriter.getContext());
@@ -339,7 +356,7 @@ public:
     }
 
     // 1. Simple case where no mask is used.
-    auto type = ptr.getType().dyn_cast<MemRefType>();
+    auto type = dyn_cast<MemRefType>(ptr.getType());
     if (!type) {
       // Seen when implicit broadcasting is done late in a chain of operations.
       // The workaround is to broadcast the pointers early in the address
@@ -365,10 +382,9 @@ public:
           auto block1 = memrefs[0];
           auto block2 = memrefs[1];
 
-          if (wrapType.getValue().equals(ModuloState::WraparoundSideBySide)) {
+          if (wrapType.getValue() == ModuloState::WraparoundSideBySide) {
             createSideBySideCopies(block1, block2, alloc, loc, rewriter);
-          } else if (wrapType.getValue().equals(
-                         ModuloState::WraparoundStacked)) {
+          } else if (wrapType.getValue() == ModuloState::WraparoundStacked) {
             createStackedCopies(block1, block2, alloc, loc, rewriter);
           } else {
             llvm_unreachable("unexpected wraparound type");
@@ -415,10 +431,10 @@ public:
         auto shapei = rewriter.create<arith::ConstantOp>(
             loc, rewriter.getIndexAttr(shape[i]));
 
-        Value dimi = mstate.dims[i].dyn_cast<Value>();
+        Value dimi = dyn_cast<Value>(mstate.dims[i]);
         if (!dimi) {
           dimi = rewriter.create<arith::ConstantOp>(
-              loc, mstate.dims[i].get<Attribute>().cast<IntegerAttr>());
+              loc, cast<IntegerAttr>(mstate.dims[i].get<Attribute>()));
         }
 
         auto cmpOp = rewriter.create<arith::CmpIOp>(
@@ -445,12 +461,12 @@ public:
         auto block1 = memrefs[0];
         auto block2 = memrefs[1];
 
-        if (wrapType.getValue().equals(ModuloState::WraparoundSideBySide)) {
+        if (wrapType.getValue() == ModuloState::WraparoundSideBySide) {
           auto [subview1, subview2] =
               mstate.getSideBySideSubviews(block1, block2, loc, rewriter);
 
           createSideBySideCopies(subview1, subview2, alloc, loc, rewriter);
-        } else if (wrapType.getValue().equals(ModuloState::WraparoundStacked)) {
+        } else if (wrapType.getValue() == ModuloState::WraparoundStacked) {
           auto [subview1, subview2] =
               mstate.getStackedSubviews(block1, block2, loc, rewriter);
 
@@ -489,7 +505,7 @@ struct StoreConverter : public OpConversionPattern<triton::StoreOp> {
     auto loc = op.getLoc();
 
     // 0. Shortcut for scalar stores
-    if (!val.getType().isa<ShapedType>()) {
+    if (!isa<ShapedType>(val.getType())) {
       auto sMemRef =
           PtrAnalysis::getScalarMemRef(op.getPtr(), ptr, loc, rewriter);
       auto zeroMap = AffineMap::getConstantMap(0, rewriter.getContext());
@@ -606,7 +622,7 @@ struct SplatConverter : public OpConversionPattern<triton::SplatOp> {
   LogicalResult
   matchAndRewrite(triton::SplatOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto opType = op.getType().cast<TensorType>();
+    auto opType = cast<TensorType>(op.getType());
     auto loc = op.getLoc();
 
     auto init = rewriter.create<tensor::EmptyOp>(loc, opType.getShape(),
@@ -720,8 +736,8 @@ struct ExpandDimsConverter : public OpConversionPattern<triton::ExpandDimsOp> {
   matchAndRewrite(triton::ExpandDimsOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto src = adaptor.getSrc();
-    auto srcRank = src.getType().cast<RankedTensorType>().getRank();
-    auto resType = op->getResultTypes()[0].cast<RankedTensorType>();
+    auto srcRank = cast<RankedTensorType>(src.getType()).getRank();
+    auto resType = cast<RankedTensorType>(op->getResultTypes()[0]);
     SmallVector<ReassociationIndices> reassoc;
     int64_t c = 0;
     for (int64_t i = 0; i < srcRank; i++) {
@@ -750,7 +766,7 @@ struct TransposeConverter : public OpConversionPattern<triton::TransOp> {
   matchAndRewrite(triton::TransOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto src = adaptor.getSrc();
-    auto srcRank = src.getType().cast<ShapedType>().getRank();
+    auto srcRank = cast<ShapedType>(src.getType()).getRank();
     assert(srcRank == 2 && "only expect transposing 2D data");
 
     auto res = getTransposedValue(src, op.getLoc(), rewriter);
@@ -766,7 +782,7 @@ struct MakeRangeConverter : public OpConversionPattern<triton::MakeRangeOp> {
   matchAndRewrite(triton::MakeRangeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto type = op.getResult().getType().cast<TensorType>();
+    auto type = cast<TensorType>(op.getResult().getType());
     auto shape = type.getShape();
     auto elementType = type.getElementType();
     auto context = rewriter.getContext();
@@ -804,11 +820,11 @@ struct AssertConverter : public OpConversionPattern<triton::AssertOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Value condVal = op.getCondition();
 
-    if (condVal.getType().isa<mlir::TensorType>()) {
+    if (isa<mlir::TensorType>(condVal.getType())) {
       auto scalarVal = getScalarValue(op.getCondition(), op.getLoc(), rewriter);
       condVal = scalarVal ? scalarVal : condVal;
     }
-    assert(condVal && condVal.getType().isa<mlir::IntegerType>() &&
+    assert(condVal && isa<mlir::IntegerType>(condVal.getType()) &&
            "Only asserts on scalars are currently supported");
 
     if (!condVal.getType().isInteger(1)) {
@@ -844,42 +860,161 @@ struct BitcastConverter : public OpConversionPattern<triton::BitcastOp> {
   }
 };
 
+struct FpToFpConverter : public OpConversionPattern<triton::FpToFpOp> {
+  using OpConversionPattern<triton::FpToFpOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::FpToFpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto roundingMode = triton::RoundingMode::RTNE; // default
+
+    auto roundingModeAttr = op.getRounding();
+    if (roundingModeAttr.has_value()) {
+      roundingMode = roundingModeAttr.value();
+    }
+
+    assert(roundingMode != triton::RoundingMode::RTZ &&
+           "Rounding Towards Zero is not supported");
+
+    Type resultType = op.getResult().getType();
+
+    auto operandWidth = getBitWidth(op.getOperand().getType());
+    auto resultWidth = getBitWidth(resultType);
+
+    assert(operandWidth.has_value() && resultWidth.has_value() &&
+        "Not a float-like operand or result");
+
+    if (operandWidth.value() > resultWidth.value()) {
+      Value truncatedValue = rewriter.create<arith::TruncFOp>(op.getLoc(), resultType, op.getOperand());
+      rewriter.replaceOp(op, truncatedValue);
+      return success();
+    }
+
+    Value extendedValue = rewriter.create<arith::ExtFOp>(op.getLoc(), resultType, op.getOperand());
+    rewriter.replaceOp(op, extendedValue);
+
+    return success();
+  }
+};
+
+struct ClampConverter : public OpConversionPattern<triton::ClampFOp> {
+  using OpConversionPattern<triton::ClampFOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ClampFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    bool propagateNan = op.getPropagateNan() == triton::PropagateNan::ALL;
+
+    assert(!propagateNan &&
+           "PropagateNan is not supported");
+
+    Location loc = op.getLoc();
+    Value x = adaptor.getOperands()[0];
+    Value min = adaptor.getOperands()[1];
+    Value max = adaptor.getOperands()[2];
+
+    Value maxMin = rewriter.create<arith::MaximumFOp>(loc, x, min);
+    Value clamp = rewriter.create<arith::MinimumFOp>(loc, maxMin, max);
+    rewriter.replaceOp(op, clamp);
+
+    return success();
+  }
+};
+
+struct PreciseSqrtConverter : public OpConversionPattern<triton::PreciseSqrtOp> {
+  using OpConversionPattern<triton::PreciseSqrtOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::PreciseSqrtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto replacement = rewriter.create<math::SqrtOp>(
+        op.getLoc(), adaptor.getOperands());
+
+    rewriter.replaceOp(op, replacement);
+    return success();
+  }
+};
+
+struct PreciseDivConverter : public OpConversionPattern<triton::PreciseDivFOp> {
+  using OpConversionPattern<triton::PreciseDivFOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::PreciseDivFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto replacement = rewriter.create<arith::DivFOp>(
+        op.getLoc(), adaptor.getOperands());
+
+    rewriter.replaceOp(op, replacement);
+    return success();
+  }
+};
+
+struct MulHiUIOpConverter : public OpConversionPattern<triton::MulhiUIOp> {
+  using OpConversionPattern<triton::MulhiUIOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::MulhiUIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    auto mulResult = rewriter.create<arith::MulUIExtendedOp>(loc, adaptor.getOperands());
+    rewriter.replaceOp(op, mulResult.getHigh());
+
+    return success();
+  }
+};
+
 struct MatmulConverter : public OpConversionPattern<triton::DotOp> {
   using OpConversionPattern<triton::DotOp>::OpConversionPattern;
+
+  // true means tensor elements are zeros
+  // false means not zero or it cannot be determined
+  bool isZeroTensor(Value &v, bool integers) const {
+      if (auto splatOp = v.getDefiningOp<triton::SplatOp>()) {
+        if (auto constOp = splatOp.getSrc().getDefiningOp<arith::ConstantOp>()) {
+          if (auto val = dyn_cast<FloatAttr>(constOp.getValue())) {
+            return val.getValueAsDouble() == 0.;
+          }
+          if (auto val = dyn_cast<IntegerAttr>(constOp.getValue())) {
+            return val.getValue() == 0;
+          }
+        }
+        return false;
+      }
+
+      if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+        if (auto denseAttr = dyn_cast<DenseElementsAttr>(constOp.getValue())) {
+          if (denseAttr.isSplat()) {
+            if (integers)
+              return denseAttr.getSplatValue<APInt>().isZero();
+            return denseAttr.getSplatValue<APFloat>().isZero();
+          }
+        }
+      }
+
+      return false;
+  }
 
   LogicalResult
   matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto opa = adaptor.getA();
-    auto opb = adaptor.getB();
-    auto opc = adaptor.getC();
-    auto opcOrig = op.getC();
-
-    bool skipC = false;
-    if (auto splatOp = opcOrig.getDefiningOp<triton::SplatOp>()) {
-      if (auto val = splatOp.getSrc().getDefiningOp<arith::ConstantOp>()) {
-        if (val.getValue().cast<FloatAttr>().getValueAsDouble() == 0.) {
-          skipC = true;
-        }
-      }
-    } else if (auto constOp = opcOrig.getDefiningOp<arith::ConstantOp>()) {
-      if (auto denseAttr = dyn_cast<DenseElementsAttr>(constOp.getValue())) {
-        if (denseAttr.isSplat() &&
-            denseAttr.getSplatValue<FloatAttr>().getValueAsDouble() == 0.) {
-          skipC = true;
-        }
-      }
-    }
+    auto loc = op.getLoc();
+    auto opa = op.getA();
+    auto opb = op.getB();
+    auto opc = op.getC();
 
     auto dstType = cast<RankedTensorType>(op.getType());
-    auto elemType = dstType.getElementType();
-    auto loc = op.getLoc();
-
+    auto elementType = dstType.getElementType();
+    bool integers = elementType.isInteger();
+    bool skipC = isZeroTensor(opc, integers);
     auto init =
-        rewriter.create<tensor::EmptyOp>(loc, dstType.getShape(), elemType);
+        rewriter.create<tensor::EmptyOp>(loc, dstType.getShape(), elementType);
+    TypedAttr constantAttr = integers ?
+      static_cast<TypedAttr>(rewriter.getIntegerAttr(elementType, 0)) :
+      static_cast<TypedAttr>(rewriter.getFloatAttr(elementType, 0));
 
     auto zero = rewriter.create<mlir::arith::ConstantOp>(
-        op.getLoc(), elemType, rewriter.getFloatAttr(elemType, 0));
+        op.getLoc(), elementType, constantAttr);
 
     auto zeroes =
         rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{init})
@@ -891,7 +1026,11 @@ struct MatmulConverter : public OpConversionPattern<triton::DotOp> {
                    .getResult(0);
 
     if (!skipC) {
-      res = rewriter.create<arith::AddFOp>(loc, res, opc);
+      if (integers) {
+        res = rewriter.create<arith::AddIOp>(loc, res, opc);
+      } else {
+        res = rewriter.create<arith::AddFOp>(loc, res, opc);
+      }
     }
 
     rewriter.replaceOp(op, res);
@@ -963,7 +1102,7 @@ private:
   }
 
   bool requiresF32Conversion(const Type elemType, Operation *redOp) const {
-    return elemType.isa<FloatType>() &&
+    return isa<FloatType>(elemType) &&
            elemType.getIntOrFloatBitWidth() <
                Float32Type::get(elemType.getContext()).getWidth() &&
            isa<arith::AddFOp>(redOp);
@@ -1071,8 +1210,7 @@ private:
     }
 
     if (convertToF32Precision) {
-      finalResult = rewriter.create<arith::TruncFOp>(
-          loc, BFloat16Type::get(rewriter.getContext()), finalResult);
+      finalResult = rewriter.create<arith::TruncFOp>(loc, resType, finalResult);
     }
 
     rewriter.replaceOp(op, finalResult);
@@ -1085,7 +1223,7 @@ public:
                   typename triton::ReduceOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto sourceType =
-        adaptor.getOperands().front().getType().cast<RankedTensorType>();
+        cast<RankedTensorType>(adaptor.getOperands().front().getType());
     assert(sourceType.hasRank() && "Expected input is "
                                    "ranked");
 
@@ -1674,7 +1812,7 @@ class AddPtrConverter : public OpConversionPattern<triton::AddPtrOp> {
   matchAndRewrite(triton::AddPtrOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto resType = op.getResult().getType();
-    assert(resType.isa<ShapedType>());
+    assert(isa<ShapedType>(resType));
     auto rank = cast<RankedTensorType>(resType).getRank();
     SmallVector<AffineMap, 3> indexingMaps(
         /*numResult + numOperands*/ 3, rewriter.getMultiDimIdentityMap(rank));

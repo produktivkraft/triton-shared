@@ -10,9 +10,11 @@
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Value.h"
 
 #include "triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
@@ -154,7 +156,7 @@ FailureOr<TilingResult> getTiledImplementation(TritonTilingExtOpTy op,
   for (OpOperand &opOperand : op->getOpOperands()) {
     unsigned int index = opOperand.getOperandNumber();
     auto val = valuesToTile[index];
-    auto type = val.getType().dyn_cast<ShapedType>();
+    auto type = dyn_cast<ShapedType>(val.getType());
 
     if (!type) {
       tiledValues.push_back(val);
@@ -226,7 +228,7 @@ LogicalResult getResultTilePosition(TritonTilingExtOpTy op, OpBuilder &b,
       op.getOutputIndexingMap(b.getContext(), resultNumber, sizes);
 
   Value result = op.getDpsInitOperand(resultNumber)->get();
-  auto rank = result.getType().dyn_cast<ShapedType>().getRank();
+  auto rank = dyn_cast<ShapedType>(result.getType()).getRank();
 
   llvm::SmallVector<mlir::OpFoldResult> composedTileSizes =
       linalg::computeTileSizes(b, loc, sizes, {});
@@ -346,20 +348,24 @@ generateResultTileValue(TritonTilingExtOpTy op, OpBuilder &b,
 static void getTritonTilingExtEffectsImpl(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects,
-    ValueRange results, const ValueRange inputOperands,
-    ValueRange outputOperands) {
+    ValueRange results, ArrayRef<OpOperand *> inputOperands,
+    const MutableOperandRange &outputOperands) {
   for (auto operand : inputOperands) {
-    if (!llvm::isa<MemRefType>(operand.getType()))
+    if (!llvm::isa<MemRefType>(operand->get().getType()))
       continue;
-    effects.emplace_back(MemoryEffects::Read::get(), operand,
+    effects.emplace_back(MemoryEffects::Read::get(), operand, /*stage=*/0,
+                         /*effectOnFullRegion=*/true,
                          SideEffects::DefaultResource::get());
   }
-  for (auto operand : outputOperands) {
-    if (!llvm::isa<MemRefType>(operand.getType()))
+  for (auto &operand : outputOperands) {
+    if (!llvm::isa<MemRefType>(operand.get().getType()))
       continue;
-    effects.emplace_back(MemoryEffects::Read::get(), operand,
+
+    effects.emplace_back(MemoryEffects::Read::get(), &operand, /*stage=*/0,
+                         /*effectOnFullRegion=*/true,
                          SideEffects::DefaultResource::get());
-    effects.emplace_back(MemoryEffects::Write::get(), operand,
+    effects.emplace_back(MemoryEffects::Write::get(), &operand, /*stage=*/0,
+                         /*effectOnFullRegion=*/true,
                          SideEffects::DefaultResource::get());
   }
 }
@@ -370,7 +376,8 @@ void getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
   getTritonTilingExtEffectsImpl(effects, op.getOperation()->getResults(),
-                                op.getDpsInputs(), op.getDpsInits());
+                                op.getDpsInputOperands(),
+                                op.getDpsInitsMutable());
 }
 
 } // namespace ttx

@@ -1,7 +1,8 @@
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
+from types import ModuleType
 import hashlib
 import tempfile
 import os
@@ -56,17 +57,17 @@ def _ttsharedir_to_llir(ttsharedir: str):
             "--one-shot-bufferize=allow-return-allocs-from-loops=true",
             "--lower-affine",
             "--convert-linalg-to-loops",
+            "--expand-strided-metadata",
             "--convert-scf-to-cf",
-            "--convert-cf-to-llvm",
             "--convert-arith-to-llvm",
             "--convert-math-to-llvm",
             "--convert-complex-to-llvm",
             "--convert-vector-to-llvm",
             "--convert-index-to-llvm",
             "--memref-expand",
-            "--expand-strided-metadata",
             "--finalize-memref-to-llvm",
             "--convert-func-to-llvm",
+            "--convert-cf-to-llvm",
             # Lowering memrefs creates more affine.apply ops.
             # Lowering these affine ops again creates further arith ops,
             # so we have to run these two passes again here.
@@ -146,7 +147,7 @@ class CPUBackend(BaseBackend):
         return CPUOptions(**args)
 
     def get_codegen_implementation(self):
-        codegen_fns = dict()
+        codegen_fns = {"min_dot_size": lambda lhsType, rhsType: (1, 1, 1)}
         return codegen_fns
 
     def pack_metadata(self, metadata):
@@ -192,3 +193,7 @@ class CPUBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         return self.target
+
+    # The CPU backend does not use any extra python modules, return an empty dictionary
+    def get_module_map(self) -> Dict[str, ModuleType]:
+        return {}

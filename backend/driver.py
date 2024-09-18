@@ -60,6 +60,13 @@ def _generate_launcher(constants, signature, kernel_name):
     args_format = ''.join([_format_of(_extracted_type(ty)) for ty in signature.values()])
     format = "iiiOOOO" + args_format
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
+
+    kernel_arg_decls = ', '.join(_ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*" for i, ty in signature.items() if i not in constants)
+    kernel_arg_decls += ', ' if kernel_arg_decls else ''
+
+    kernel_parameters = ', '.join(f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}" for i, ty in signature.items() if i not in constants)
+    kernel_parameters += ', ' if kernel_parameters else ''
+
     return f"""
 #include <assert.h>
 #include <stdbool.h>
@@ -70,7 +77,7 @@ def _generate_launcher(constants, signature, kernel_name):
 extern "C" {{
   // Pointer type (=Memref) becomes int64_t + MemRef struct
   // FIXME: understand what this int64_t is used for.
-  void {kernel_name}({', '.join(_ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*" for i, ty in signature.items() if i not in constants)},
+  void {kernel_name}({kernel_arg_decls}
                        int, int, int, int, int, int);
 }}
 
@@ -82,7 +89,7 @@ static void _launch(int gridX, int gridY, int gridZ, {arg_decls}) {{
         for(int z = 0; z < gridZ; z++) {{
           // Use some random type "char" here.
           {' '.join(f'StridedMemRefType<char, 0> ptr_arg{i} = {{static_cast<char *>(arg{i}), static_cast<char *>(arg{i}), 0}};' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
-          {kernel_name}({', '.join(f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}" for i, ty in signature.items() if i not in constants)},
+          {kernel_name}({kernel_parameters}
                         gridX, gridY, gridZ, x, y, z);
         }}
       }}
@@ -215,6 +222,9 @@ def compile_module(launcher_src, kernel_placeholder_name):
     if scheme == 'posix_local':
         scheme = 'posix_prefix'
     py_include_dir = sysconfig.get_paths(scheme=scheme)["include"]
+    py_lib_dir = sysconfig.get_config_var("LIBDIR")
+    py_version = sysconfig.get_config_var("LDVERSION")
+    py_lib = '{name}{py_version}'.format(name="python", py_version=py_version)
     cpu_backend_path = Path(__file__).resolve().parent
     include_dir = os.path.join(cpu_backend_path, "include")
 
@@ -230,7 +240,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
         kernel_name = kernel_metadata[6] # see pack_metadata in compiler.py
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
-        key = hashlib.md5(src.encode("utf-8")).hexdigest()
+        key = hashlib.md5(src.encode("utf-8") + asm_src).hexdigest()
         cache = get_cache_manager(key)
         name = "__triton_shared_ref_cpu_kernel_launcher"
         filename = f"{name}.so"
@@ -245,9 +255,9 @@ def compile_module(launcher_src, kernel_placeholder_name):
               Path(launcher_src_path).write_text(src)
               # Compile it together.
               subprocess.check_call([
-                "g++", launcher_src_path, asm_src_path,
-                f"-I{py_include_dir}", f"-I{include_dir}",
-                "-shared", "-fPIC", "-o", so_path
+                "g++", "-std=c++17", launcher_src_path, asm_src_path,
+                f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
+                "-shared", f"-l{py_lib}", "-fPIC", "-o", so_path
               ])
 
               with open(so_path, "rb") as f:
