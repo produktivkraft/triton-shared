@@ -1,3 +1,6 @@
 *.pyc
 .cache
 compile_commands.json
+
+build
+CMakeUserPresets.json
