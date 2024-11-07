@@ -12,7 +12,9 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
+#include "mlir/Support/LogicalResult.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/Support/LogicalResult.h"
 
 #include <utility>
 
@@ -47,6 +49,9 @@ struct MaskState {
   OpFoldResult end;
   SmallVector<OpFoldResult> dims;
   OpFoldResult scalar;
+  const bool useUnsafeMask;
+
+  MaskState(bool useUnsafeMask = false) : useUnsafeMask(useUnsafeMask) {}
 
   int64_t getRank() const { return dims.size(); }
 
@@ -58,9 +63,8 @@ struct MaskState {
   // defining operation and Value type
   LogicalResult parse(Value operand, const Location loc, OpBuilder &builder);
 
-  tensor::ExtractSliceOp
-  getExtractSlice(Value source, const Location loc,
-                  OpBuilder &builder) const;
+  tensor::ExtractSliceOp getExtractSlice(Value source, const Location loc,
+                                         OpBuilder &builder) const;
 
   memref::SubViewOp getSubview(Value source, const Location loc,
                                OpBuilder &builder) const;
@@ -89,6 +93,9 @@ private:
   // -------
   // Helper functions to parse values to populate MaskState
   // -------
+
+  LogicalResult parseExtSI(arith::ExtSIOp op, const Location loc,
+                           OpBuilder &builder);
 
   // Operand is the result of a constant
   // Get the value of the constant and assign it to scalar.
@@ -134,6 +141,9 @@ private:
   // dimension that contains the range.
   LogicalResult parseExpandDims(triton::ExpandDimsOp expandDimsOp,
                                 const Location loc, OpBuilder &builder);
+
+  LogicalResult parseLoopIterArg(Value v, const Location loc,
+                                 OpBuilder &builder);
 };
 
 } // namespace triton

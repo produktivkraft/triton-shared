@@ -12,6 +12,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
+#include "mlir/IR/Value.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -90,11 +92,10 @@ class PtrAnalysis {
       scf::ForOp forOp, size_t ptrArgIndex, const PtrState &state,
       llvm::function_ref<Value(scf::ForOp op, size_t)> getReplacementVal);
 
-public:
-  using IndexMapSet = std::map<int, std::set<int>>;
+  DenseSet<Value> maybeStructuredArgs;
 
-  IndexMapSet levelToBlockArgIndex;
-  int level = 0;
+public:
+  void initializeMaybeStructuredArgs(Operation *op);
 
   llvm::SmallDenseMap<Value, PtrState> knownPtrs;
 
@@ -194,6 +195,9 @@ public:
   LogicalResult visitOperandConstSplat(arith::ConstantOp op, PtrState &state,
                                        const Location loc, OpBuilder &builder);
 
+  LogicalResult visitOperandExtSI(arith::ExtSIOp, PtrState &state,
+                                  const Location loc, OpBuilder &builder);
+
   // Operand is the result of addptr.
   // Main assumptions:
   //  The ptr field should populate the source field
@@ -254,11 +258,11 @@ public:
   // strides, offsets, and modulos.
   LogicalResult rewriteForOp(scf::ForOp op);
 
-  LogicalResult rewriteLoadOp(triton::LoadOp op);
+  LogicalResult rewriteLoadOp(triton::LoadOp op, bool useUnsafeMask = false);
 
-  LogicalResult rewriteStoreOp(triton::StoreOp op);
+  LogicalResult rewriteStoreOp(triton::StoreOp op, bool useUnsafeMask = false);
 
-  LogicalResult rewriteOp(Operation *op);
+  LogicalResult rewriteOp(Operation *op, bool useUnsafeMask = false);
 };
 
 } // namespace tts
