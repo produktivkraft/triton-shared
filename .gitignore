@@ -1,7 +1,12 @@
+.vscode
+build
+CMakeUserPresets.json
+
 *.pyc
 .cache
 compile_commands.json
 
-.vscode
-build
-CMakeUserPresets.json
+build/*
+.vscode/*
+/python/examples/test_core.py
+/python/examples/test_annotations.py

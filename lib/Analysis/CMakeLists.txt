@@ -5,9 +5,8 @@ add_triton_library(TritonSharedAnalysis
   UseAnalysis.cpp
 
   DEPENDS
-  TritonAnalysis
   TritonTableGen
-  TritonGPUAttrDefsIncGen
+  TritonStructuredTableGen
 
   LINK_LIBS PUBLIC
   MLIRAnalysis

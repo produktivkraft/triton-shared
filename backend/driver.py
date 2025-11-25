@@ -2,9 +2,9 @@ import hashlib
 import tempfile
 import sysconfig
 
-import os, subprocess, tempfile
+import os, subprocess, tempfile, platform
 import importlib.util
-import sysconfig
+import sys
 
 from pathlib import Path
 
@@ -12,10 +12,37 @@ from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 
+def _get_llvm_bin_path(bin_name: str) -> str:
+    path = os.getenv("LLVM_BINARY_DIR", "")
+    if path == "":
+        raise Exception("LLVM_BINARY_DIR is not set.")
+    return os.path.join(path, bin_name)
+
+def _get_sanitizer_type():
+    # returns "" if not set
+    # throws error if set to something other than "asan" or "tsan"
+    sanitizer_type = os.getenv("TRITON_SHARED_SANITIZER_TYPE", "")
+
+    if sanitizer_type != "" and sanitizer_type != "asan" and sanitizer_type != "tsan":
+        # throw error
+        raise Exception(f"TRITON_SHARED_SANITIZER_TYPE {sanitizer_type} is invalid.")
+    
+    return sanitizer_type
+
+def _sanitizer_available(sanitizer_type):
+    if "LD_PRELOAD" not in os.environ:
+        return False
+    if f"libclang_rt.{sanitizer_type}.so" not in os.environ["LD_PRELOAD"]:
+        return False
+    
+    return True
+
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
     if ty[0] == '*':
         return "void*"
+    if ty == "constexpr":
+        return "PyObject*"
     return {
         "i1": "int32_t",
         "i8": "int8_t",
@@ -27,8 +54,10 @@ def _ty_to_cpp(ty):
         "u16": "uint16_t",
         "u32": "uint32_t",
         "u64": "uint64_t",
-        "fp16": "float",
-        "bf16": "float",
+        # Proper support for bfloat16 and float16 is not yet handled.
+        # https://github.com/microsoft/triton-shared/issues/348
+        # "fp16": "TODO",
+        # "bf16": "TODO",
         "fp32": "float",
         "f32": "float",
         "fp64": "double",
@@ -37,11 +66,14 @@ def _ty_to_cpp(ty):
 def _extracted_type(ty):
     if ty[0] == '*':
         return "PyObject*"
+    if ty == "constexpr":
+        return "PyObject*"
     return _ty_to_cpp(ty)
 
 def _format_of(ty):
     return {
       "PyObject*": "O",
+      "constexpr": "O",
       "float": "f",
       "double": "d",
       "long": "l",
@@ -61,10 +93,10 @@ def _generate_launcher(constants, signature, kernel_name):
     format = "iiiOOOO" + args_format
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
 
-    kernel_arg_decls = ', '.join(_ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*" for i, ty in signature.items() if i not in constants)
+    kernel_arg_decls = ', '.join(_ty_to_cpp(ty) if ty[0] != "*" else f"int64_t, void*" for i, ty in signature.items() if ty != "constexpr")
     kernel_arg_decls += ', ' if kernel_arg_decls else ''
 
-    kernel_parameters = ', '.join(f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}" for i, ty in signature.items() if i not in constants)
+    kernel_parameters = ', '.join(f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}" for i, ty in signature.items() if ty != "constexpr")
     kernel_parameters += ', ' if kernel_parameters else ''
 
     return f"""
@@ -84,6 +116,9 @@ extern "C" {{
 static void _launch(int gridX, int gridY, int gridZ, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
     // Cast "function" to the real function type.
+    // apply parallelization to the triton grid when using ThreadSanitizer (TSan) 
+    // to help detect potential data races across program instances during kernel execution
+    {"#pragma omp parallel for collapse(3)" if _get_sanitizer_type() == "tsan" else ""}
     for(int x = 0; x < gridX; x++) {{
       for(int y = 0; y < gridY; y++) {{
         for(int z = 0; z < gridZ; z++) {{
@@ -212,19 +247,15 @@ PyMODINIT_FUNC PyInit___triton_shared_ref_cpu_kernel_launcher(void) {{
 
 
 def compile_module(launcher_src, kernel_placeholder_name):
-    # This function was renamed and made public in Python 3.10
-    if hasattr(sysconfig, 'get_default_scheme'):
-        scheme = sysconfig.get_default_scheme()
+    py_version = sys.version_info
+    if platform.system() == "Windows":
+        py_include_dir = os.path.join(sys.base_prefix, 'include')
+        py_lib_dir = os.path.join(sys.base_prefix, 'libs')
+        py_lib = '{name}{major}{minor}.lib'.format(name="python", major=py_version.major, minor=py_version.minor)
     else:
-        scheme = sysconfig._get_default_scheme()
-    # 'posix_local' is a custom scheme on Debian. However, starting Python 3.10, the default install
-    # path changes to include 'local'. This change is required to use triton with system-wide python.
-    if scheme == 'posix_local':
-        scheme = 'posix_prefix'
-    py_include_dir = sysconfig.get_paths(scheme=scheme)["include"]
-    py_lib_dir = sysconfig.get_config_var("LIBDIR")
-    py_version = sysconfig.get_config_var("LDVERSION")
-    py_lib = '{name}{py_version}'.format(name="python", py_version=py_version)
+        py_include_dir = os.path.join(sys.base_prefix, 'include', f'python{sys.version_info.major}.{sys.version_info.minor}')
+        py_lib_dir = os.path.join(sys.base_prefix, 'lib')
+        py_lib = '{name}{major}.{minor}'.format(name="python", major=py_version.major, minor=py_version.minor)
     cpu_backend_path = Path(__file__).resolve().parent
     include_dir = os.path.join(cpu_backend_path, "include")
 
@@ -233,38 +264,90 @@ def compile_module(launcher_src, kernel_placeholder_name):
         kernel_metadata, launch_metadata,
         launch_enter_hook, launch_exit_hook, *args):
         # Unlike CUDA/HIP, we cannot easily pass function pointer across different pybind libraries.
-        # Let's compile a kernel every time.
-        # The cu_function parameter actually contains our assembly source code.
+        # Let's compile one kernel every time.
+        # The cu_function parameter actually contains our kernel obj.
         # See CPUUtils.load_binary method.
-        asm_src = cu_function
+        kernel_obj = cu_function
         kernel_name = kernel_metadata[6] # see pack_metadata in compiler.py
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
-        key = hashlib.md5(src.encode("utf-8") + asm_src).hexdigest()
+        key = hashlib.sha256(src.encode("utf-8") + kernel_obj).hexdigest()
         cache = get_cache_manager(key)
         name = "__triton_shared_ref_cpu_kernel_launcher"
-        filename = f"{name}.so"
+
+        if platform.system() == "Windows":
+          filename = f"{name}.pyd"
+        else:
+          filename = f"{name}.so"
         cache_path = cache.get_file(filename)
 
         if cache_path is None:
           with tempfile.TemporaryDirectory() as tmpdir:
-              asm_src_path = os.path.join(tmpdir, "kernel.s")
-              launcher_src_path = os.path.join(tmpdir, "main.cxx")
-              so_path = os.path.join(tmpdir, "kernel.so")
-              Path(asm_src_path).write_bytes(asm_src)
-              Path(launcher_src_path).write_text(src)
-              # Compile it together.
-              subprocess.check_call([
-                "g++", "-std=c++17", launcher_src_path, asm_src_path,
-                f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
-                "-shared", f"-l{py_lib}", "-fPIC", "-o", so_path
-              ])
+              sanitizer_type = _get_sanitizer_type()
+
+              if platform.system() == "Windows":
+                  if sanitizer_type != "":
+                      raise Exception("Sanitizers are not supported on Windows with triton-shared.")
+
+                  obj_path = os.path.join(tmpdir, "kernel.obj")
+                  launcher_src_path = os.path.join(tmpdir, "main.cxx")
+                  so_path = os.path.join(tmpdir, "kernel.pyd")
+                  Path(obj_path).write_bytes(kernel_obj)
+                  Path(launcher_src_path).write_text(src)
+                  # Compile it together.
+                  subprocess.check_call([
+                    "cl", "/LD", "/std:c++17", launcher_src_path, obj_path,
+                    f"-I{py_include_dir}", f"-I{include_dir}", "/link", f"/LIBPATH:{py_lib_dir}",
+                    "/link", f"{py_lib}", f"/OUT:{so_path}"
+                  ])
+              else:
+                  obj_path = os.path.join(tmpdir, "kernel.o")
+                  launcher_src_path = os.path.join(tmpdir, "main.cxx")
+                  so_path = os.path.join(tmpdir, "kernel.so")
+                  Path(obj_path).write_bytes(kernel_obj)
+                  Path(launcher_src_path).write_text(src)
+
+                  # Compile it together.
+                  if sanitizer_type != "":
+                      clang_path = _get_llvm_bin_path("clang++")
+
+                      subprocess_args = [
+                          clang_path, "-std=c++17", launcher_src_path, obj_path,
+                          f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
+                          "-shared", f"-l{py_lib}", "-fPIC", "-o", so_path
+                      ]
+
+                      if not _sanitizer_available(sanitizer_type):
+                          raise Exception(f"Use LD_PRELOAD=\"path/to/libclang_rt.{sanitizer_type}.so\" TRITON_SHARED_SANITIZER_TYPE={sanitizer_type} python ...")
+
+                      if sanitizer_type == "asan":
+                          subprocess_args.extend(["-g", "-fsanitize=address", "-mllvm", "-asan-stack=0"])
+                      elif sanitizer_type == "tsan":
+                          # ensure that openmp is available
+                          libomp_path = next(Path(Path(_get_llvm_bin_path("")).parent).rglob("libomp.so"), None)
+
+                          if not libomp_path:
+                              raise Exception(f"libomp.so does not exist.")
+
+                          libomp_path = str(libomp_path.parent)
+
+                          subprocess_args.extend(["-g", "-fsanitize=thread", "-fopenmp", f"-Wl,-rpath,{libomp_path}"])
+                      
+                      subprocess.check_call(subprocess_args)
+                  else:
+                      subprocess.check_call([
+                        "g++", "-std=c++17", launcher_src_path, obj_path,
+                        f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
+                        "-shared", f"-l{py_lib}", "-fPIC", "-o", so_path
+                      ])
 
               with open(so_path, "rb") as f:
                 cache_path = cache.put(f.read(), filename, binary=True)
 
         # Load and launch the compiled kernel.
         spec = importlib.util.spec_from_file_location(name, cache_path)
+        if spec is None:
+            raise RuntimeError(f"Cannot find {name} module in {cache_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod.launch(gridX, gridY, gridZ,
@@ -321,15 +404,16 @@ class CPUUtils(object):
 
     # Important note:
     # Since we cannot easy pass function pointers around, we pass along the
-    # assembly source code so that compile_module above can recompile the
+    # obj of the kernel so that compile_module above can recompile the
     # module every time.
     @staticmethod
-    def load_binary(name, kernel_asm, shared, device):
+    def load_binary(name, kernel_obj, shared, device):
         return (
           None,       # module
-          kernel_asm, # function
+          kernel_obj, # function
           None,       # n_regs
-          None        # n_spills
+          None,        # n_spills
+          sys.maxsize, # n_max_threads
         )
 
 
@@ -339,13 +423,17 @@ class CPUDriver(DriverBase):
         super().__init__()
         self.utils = CPUUtils()
         self.launcher_cls = CPULauncher
-        self.binary_ext = "cpuasm"
+        self.binary_ext = "obj"
 
     # CPU driver won't be automatically chosen unless explicitly set through
     # triton.runtime.driver.set_active(CPUDriver())
     @staticmethod
     def is_active():
         return False
+
+    def get_benchmarker(self):
+        from triton.testing import do_bench
+        return do_bench
 
     def get_device_capability(self):
         return ("cpu", 0)
@@ -365,5 +453,13 @@ class CPUDriver(DriverBase):
     def get_current_target(self):
         return GPUTarget("cpu", 0, 0)
 
+    def get_active_torch_device(self):
+        import torch
+        return torch.device("cpu")
+
     def assemble_tensormap_to_arg(self, tensormaps_info, args):
         return args
+    
+    def map_python_to_cpp_type(self, ty: str) -> str:
+        return _ty_to_cpp(ty)
+  

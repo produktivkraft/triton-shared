@@ -44,14 +44,35 @@ namespace triton {
 //
 // Example of creating 2D mask:
 //  mask = (rows[:, None] < M) & (cols[None, :] < N)
+//
+// Bool tensor mask could be saved into masks in case that dimension failed
+// MaskAnalysis. These is to allow case where only one dimension failed while
+// others passed. A MakeGatherScatterTensorPtrOp operation could be generated
+// for the failed dimension. Only 3 patterns are supported for this.
+// 1. offsets[:, None] < n where the offsets is 1d tensor.
+//    It will in pattern of expandDims -> broadcast -> cmp
+// 2. mask[:, None] where mask is 1d bool tensor.
+//    It will in pattern of cmp -> expandDims -> broadcast
+// 3. scalar_mask[:, None] where scalar mask is scalar bool.
+//    It will in pattern of splat -> expandDims -> broadcast
+// These 3 patterns are only about how a bool tensor was created from 1D or
+// scalar bool. How the 1D and scalar bool were created is not important for the
+// unstructured mask.
+// Only one tensor mask is allowed. If multiple dimensions have failed
+// MaskAnalysis, then MaskAnalysis will still fail on the current operation.
 struct MaskState {
   OpFoldResult start;
   OpFoldResult end;
   SmallVector<OpFoldResult> dims;
+  SmallVector<Value> masks;
   OpFoldResult scalar;
   const bool useUnsafeMask;
 
+  void dump() const;
+
   MaskState(bool useUnsafeMask = false) : useUnsafeMask(useUnsafeMask) {}
+
+  SmallVector<std::pair<unsigned, Value>> getUnstructuredMasks();
 
   int64_t getRank() const { return dims.size(); }
 
@@ -88,6 +109,10 @@ private:
   LogicalResult addStates(const MaskState &lhsState, const MaskState &rhsState,
                           Location loc, OpBuilder &builder);
 
+  LogicalResult minStateScalar(const MaskState &lhsState,
+                               const MaskState &rhsState, Location loc,
+                               OpBuilder &builder);
+
   LogicalResult minStates(const MaskState &lhsState, const MaskState &rhsState,
                           Location loc, OpBuilder &builder);
   // -------
@@ -118,9 +143,17 @@ private:
                          OpBuilder &builder);
 
   // Operand is the result of cmpi
-  // Assume only of the dimensions have size > 1. Only support slt for now.
-  // For that dimension, calculate this new dim as: dim = min(end, value) -
-  // start
+  // Assume only one of the dimensions has size > 1. Only support slt/ult, and
+  // sge against 0 for now. For that dimension, we have three cases:
+  //  1. Constant comparison with both left and right-hand sides being scalars.
+  //     Calculate this new dim as a compare and select.
+  //      I.e. dim = lhs < rhs ? end : 0
+  //  2. Left-hand side is not a scalar, and the right-hand side is.
+  //      2.a. Predicate is slt/ult. Calculate this new dim as:
+  //            dim = max(min(end, value), start) - start
+  //      2.b. Predicate is sge against 0. Mask analysis already has an
+  //            assumption that the mask starts at 0, so evaluate this to true
+  //            and calculate this new dim as: dim = end
   LogicalResult parseCmp(arith::CmpIOp cmpOp, const Location loc,
                          OpBuilder &builder);
   // Operand is the result of make_range

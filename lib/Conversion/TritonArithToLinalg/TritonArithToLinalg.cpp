@@ -40,9 +40,17 @@ void mlir::triton::populateTritonArithToLinalgCanonicalizationPatterns(
       patterns.getContext());
 }
 
+void mlir::triton::populateTritonTensorPtrConversionPatterns(
+    RewritePatternSet &patterns) {
+  patterns.add<StorePtrToLinalgConverter, TensorOpConverter<triton::LoadOp>,
+               TensorOpConverter<triton::IntToPtrOp>,
+               TensorOpConverter<triton::PtrToIntOp>,
+               TensorOpConverter<triton::BitcastOp>>(patterns.getContext());
+}
+
 void mlir::triton::populateTritonArithToLinalgConversionPatterns(
     bool pidsToFuncArgs, bool addptrToLinalg, bool assertToCf,
-    RewritePatternSet &patterns) {
+    bool transposeReduceToRank0, RewritePatternSet &patterns) {
 
   if (pidsToFuncArgs) {
     patterns.add<GetProgramIDConverter, GetNumProgramsConverter>(
@@ -59,13 +67,18 @@ void mlir::triton::populateTritonArithToLinalgConversionPatterns(
   patterns.add<MakeRangeConverter>(patterns.getContext());
   patterns.add<ExpandDimsConverter>(patterns.getContext());
   patterns.add<BitcastConverter>(patterns.getContext());
+  patterns.add<CallConverter>(patterns.getContext());
   patterns.add<MulHiUIOpConverter>(patterns.getContext());
   patterns.add<PreciseSqrtConverter>(patterns.getContext());
   patterns.add<PreciseDivConverter>(patterns.getContext());
+  patterns.add<CatConverter>(patterns.getContext());
+  patterns.add<SplitConverter>(patterns.getContext());
+  patterns.add<JoinConverter>(patterns.getContext());
   patterns.add<FpToFpConverter>(patterns.getContext());
   patterns.add<ClampConverter>(patterns.getContext());
   patterns.add<MatmulConverter>(patterns.getContext());
   patterns.add<SplatConverter>(patterns.getContext());
+  patterns.add<UnsplatConverter>(patterns.getContext());
   patterns.add<DenseConstantConverter>(patterns.getContext());
   patterns.add<CumSumConverter>(patterns.getContext());
   patterns.add<ReshapeConverter>(patterns.getContext());
@@ -84,7 +97,7 @@ void mlir::triton::populateTritonArithToLinalgConversionPatterns(
   // aren't always multiple of 2s, which are sub-optimal for certain hardwares.
   patterns.add<ArgMinConverter>(patterns.getContext());
   patterns.add<ArgMaxConverter>(patterns.getContext());
-  patterns.add<ReduceConverter>(patterns.getContext());
+  patterns.add<ReduceConverter>(patterns.getContext(), transposeReduceToRank0);
 
   // Note: the ordering here matters!
   // These patterns are added last to they will be tried last.

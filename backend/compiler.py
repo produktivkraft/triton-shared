@@ -7,8 +7,10 @@ import hashlib
 import tempfile
 import os
 import re
+import shutil
 import subprocess
 import functools
+import triton
 from pathlib import Path
 
 def _get_triton_shared_opt_path() -> str:
@@ -25,6 +27,24 @@ def _get_llvm_bin_path(bin_name: str) -> str:
     return os.path.join(path, bin_name)
 
 
+def _dump_ir_if_needed(files):
+    path = os.getenv("TRITON_SHARED_DUMP_PATH", "")
+    if not path:
+        return
+    for f in files:
+        shutil.copy(f, os.path.join(path, os.path.basename(f)))
+
+def _get_sanitizer_type():
+    # returns "" if not set
+    # throws error if set to something other than "asan" or "tsan"
+    sanitizer_type = os.getenv("TRITON_SHARED_SANITIZER_TYPE", "")
+
+    if sanitizer_type != "" and sanitizer_type != "asan" and sanitizer_type != "tsan":
+        # throw error
+        raise Exception(f"TRITON_SHARED_SANITIZER_TYPE {sanitizer_type} is invalid.")
+    
+    return sanitizer_type
+
 def _ttir_to_ttsharedir(mod):
     # Get Triton-MLIR as string
     ttir_code = str(mod)
@@ -32,8 +52,18 @@ def _ttir_to_ttsharedir(mod):
         src_path = os.path.join(tmpdir, "tt.mlir")
         dst_path = os.path.join(tmpdir, "ttshared.mlir")
         Path(src_path).write_text(ttir_code)
+        _dump_ir_if_needed([src_path])
         triton_shared_opt_path = _get_triton_shared_opt_path()
-        subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
+
+        subprocess_args = [triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "--mlir-print-debuginfo", "-o", dst_path]
+
+        if _get_sanitizer_type() != "":
+            print("Building with sanitizer support...")
+
+            # has to run before the other passes as operates on the tt dialect
+            subprocess_args.insert(2, "--add-llvm-debug-info")
+
+        subprocess.check_call(subprocess_args)
         return Path(dst_path).read_text()
 
 
@@ -80,6 +110,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
             "--convert-arith-to-llvm",
             # Remove all unrealized casts created
             "--reconcile-unrealized-casts",
+            "--mlir-print-debuginfo",
             "-o",
             llmlir_path])
 
@@ -89,6 +120,7 @@ def _ttsharedir_to_llir(ttsharedir: str):
             "--mlir-to-llvmir",
             "-o",
             llir_path])
+        _dump_ir_if_needed([ttshared_path, llmlir_path, llir_path])
         return Path(llir_path).read_text()
 
 
@@ -106,10 +138,41 @@ def _llir_to_bin(llir: str, metadata):
         src_path = os.path.join(tmpdir, "kernel.ll")
         dst_path = os.path.join(tmpdir, "kernel.o")
         Path(src_path).write_text(llir)
-        llc_path = _get_llvm_bin_path("llc")
-        subprocess.check_call([llc_path, src_path, "-o", dst_path])
-        # Actually it's text-format assembly.  Use read_text().
-        return Path(dst_path).read_text()
+
+        sanitizer_type = _get_sanitizer_type()
+
+        if sanitizer_type != "":
+            # using a sanitizer
+            # invoke pass to append sanitizer attributes
+            instrumented_src_path = os.path.join(tmpdir, "kernel-instrumented.ll")
+        
+            opt_path = _get_llvm_bin_path("opt")
+            top_level_triton_path = os.path.dirname(triton.__file__)
+            sanitizer_attributes_pass_path = str(next(Path(top_level_triton_path).rglob("libSanitizerAttributes.so"), None))
+
+            if not sanitizer_attributes_pass_path:
+                raise Exception(f"libSanitizerAttributes.so does not exist.")
+
+            subprocess.check_call([opt_path, "-load-pass-plugin", sanitizer_attributes_pass_path, 
+                "-passes=sanitizer-attributes", f"-sanitizer-type={sanitizer_type}", "-S", src_path, 
+                "-o", instrumented_src_path])
+
+            # compile to object file
+            clang_path = _get_llvm_bin_path("clang++")
+
+            subprocess_args = [clang_path, "-c", instrumented_src_path, "-o", dst_path]
+
+            if sanitizer_type == "asan":
+                subprocess_args.extend(["-g", "-fsanitize=address", "-mllvm", "-asan-stack=0"])
+            elif sanitizer_type == "tsan":
+                subprocess_args.extend(["-g", "-fsanitize=thread"])
+                
+            subprocess.check_call(subprocess_args)
+        else:
+            llc_path = _get_llvm_bin_path("llc")
+            subprocess.check_call([llc_path, src_path, "-filetype=obj", "-relocation-model=pic", "-o", dst_path])
+        
+        return Path(dst_path).read_bytes()
 
 
 
@@ -125,19 +188,23 @@ class CPUOptions:
     extern_libs = None
     cluster_dims: tuple = (1, 1, 1)
     shared: bool = False
+    # Disable FP8 here since this is a sample CPU backend.
+    # Target specific backends can eanble it with supported types.
+    supported_fp8_dtypes: Tuple[str] = ()
     allow_fp8e4nv: bool = False
     allowed_dot_input_precisions: Tuple[str] = ("ieee", )
+    sanitize_overflow: bool = True
 
     def __post_init__(self):
         pass
 
     def hash(self):
         key = '_'.join([f'{name}-{val}' for name, val in self.__dict__.items()])
-        return hashlib.md5(key.encode("utf-8")).hexdigest()
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 class CPUBackend(BaseBackend):
-    binary_ext = 'cpuasm'
+    binary_ext = 'obj'
 
     @staticmethod
     def supports_target(target: GPUTarget):
@@ -151,7 +218,7 @@ class CPUBackend(BaseBackend):
         args.update({k: opts[k] for k in CPUOptions.__dataclass_fields__.keys() if k in opts})
         return CPUOptions(**args)
 
-    def get_codegen_implementation(self):
+    def get_codegen_implementation(self, options):
         codegen_fns = {"min_dot_size": lambda lhsType, rhsType: (1, 1, 1)}
         return codegen_fns
 
@@ -175,24 +242,28 @@ class CPUBackend(BaseBackend):
         return
 
     @staticmethod
-    def make_ttir(mod, metadata, opt):
+    def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
-        passes.ttir.add_combine(pm)
+        passes.ttir.add_rewrite_tensor_pointer(pm)
+        passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
+        passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
-        passes.common.add_licm(pm)
+        passes.ttir.add_triton_licm(pm)
         passes.common.add_symbol_dce(pm)
+        passes.ttir.add_loop_unroll(pm)
+        passes.common.add_cse(pm)
         pm.run(mod)
         return mod
 
-    def add_stages(self, stages, options):
+    def add_stages(self, stages, options, language):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(_ttir_to_ttsharedir(src))
         stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))
-        stages["cpuasm"] = lambda src, metadata: _llir_to_bin(src, metadata)
+        stages["obj"] = lambda src, metadata: _llir_to_bin(src, metadata)
 
 
     @functools.lru_cache()

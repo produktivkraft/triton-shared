@@ -8,6 +8,7 @@
 #include "triton-shared/Analysis/MaskAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Support/LogicalResult.h"
 
 #include "triton-shared/Analysis/OpFoldResultUtils.h"
@@ -21,6 +22,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 #include <cassert>
+
+#define DEBUG_TYPE "mask-analysis"
 
 namespace mlir {
 
@@ -197,15 +200,18 @@ LogicalResult MaskState::addStates(const MaskState &lhsState,
                                    const MaskState &rhsState, Location loc,
                                    OpBuilder &builder) {
   if (lhsState.scalar && rhsState.scalar) {
-    InFlightDiagnostic diag =
-        emitError(loc) << "Unexpected case where both lhs and rhs are scalars";
+    LLVM_DEBUG({
+      InFlightDiagnostic diag =
+          emitRemark(loc, "Unexpected case where both lhs and rhs are scalars");
+    });
     return failure();
   }
 
   if (!lhsState.scalar && !rhsState.scalar) {
-    InFlightDiagnostic diag =
-        emitError(loc)
-        << "Unsupported scenario where neither lhs nor rhs is a scalar";
+    LLVM_DEBUG({
+      InFlightDiagnostic diag = emitRemark(
+          loc, "Unsupported scenario where neither lhs nor rhs is a scalar");
+    });
     return failure();
   }
 
@@ -215,13 +221,59 @@ LogicalResult MaskState::addStates(const MaskState &lhsState,
     return addStateScalar(lhsState, rhsState.scalar, loc, builder);
 }
 
+LogicalResult MaskState::minStateScalar(const MaskState &lhsState,
+                                        const MaskState &rhsState, Location loc,
+                                        OpBuilder &builder) {
+  // Conjunction where both sides are scalar should not be done after splats. We
+  // should ensure that code generation pushes the splat as late as possible.
+  if (lhsState.scalar && rhsState.scalar) {
+    LLVM_DEBUG({
+      InFlightDiagnostic diag =
+          emitRemark(loc, "Unexpected case where both lhs and rhs are scalars");
+    });
+    return failure();
+  }
+
+  // Caller should ensure that at least one side is scalar.
+  if (!lhsState.scalar && !rhsState.scalar) {
+    LLVM_DEBUG({
+      InFlightDiagnostic diag = emitRemark(
+          loc, "Unexpected case where both lhs and rhs are not scalars");
+    });
+    return failure();
+  }
+
+  // If we see a scalar condition in a conjunction with a mask, this means we
+  // are either going to take the mask dimension or take nothing at all. To do
+  // that we use a select on the scalar value with the mask dimension in the
+  // true case and zero in the false case.
+  //
+  // Example:
+  // def kernel(..., index: i32, ...):
+  //   ...
+  //   offs = tl.arange(0, 8)
+  //   mask = offs < 4
+  //   scalar = index < 4
+  //   ... = tl.load(some_ptr, mask=scalar & mask, other=0)
+  auto &scalarState = lhsState.scalar ? lhsState : rhsState;
+  auto &nonScalarState = lhsState.scalar ? rhsState : lhsState;
+  for (uint32_t i = 0; i < nonScalarState.getRank(); i++) {
+    auto nonScalarDim = nonScalarState.dims[i];
+    dims.push_back(selectOFRs(scalarState.scalar, nonScalarDim,
+                              builder.getZeroAttr(builder.getIndexType()), loc,
+                              builder));
+  }
+  return success();
+}
+
 LogicalResult MaskState::minStates(const MaskState &lhsState,
                                    const MaskState &rhsState, Location loc,
                                    OpBuilder &builder) {
   if (lhsState.getRank() != rhsState.getRank()) {
-    InFlightDiagnostic diag =
-        emitError(loc)
-        << "Unexpected case where lhs and rhs have different ranks";
+    LLVM_DEBUG({
+      InFlightDiagnostic diag = emitRemark(
+          loc, "Unexpected case where lhs and rhs have different ranks");
+    });
     return failure();
   }
 
@@ -259,10 +311,30 @@ LogicalResult MaskState::parseConstant(arith::ConstantOp constOp,
 LogicalResult MaskState::parseIntScalar(Value scalar, const Location loc,
                                         OpBuilder &builder) {
   assert(this->isEmpty());
-  auto castOp =
-      builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), scalar);
-  this->scalar = castOp.getResult();
+  if (scalar.getType().isInteger(1)) {
+    this->scalar = scalar;
+  } else {
+    auto castOp =
+        builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), scalar);
+    this->scalar = castOp.getResult();
+  }
   return success();
+}
+
+void MaskState::dump() const {
+  llvm::dbgs() << "start: " << start << "\n";
+  llvm::dbgs() << "end: " << end << "\n";
+  llvm::dbgs() << "scalar: " << scalar << "\n";
+  llvm::dbgs() << "useUnsafeMask: " << useUnsafeMask << "\n";
+  llvm::dbgs() << "dims: ";
+  for (auto dim : dims)
+    llvm::dbgs() << "\t" << dim << "\n";
+  if (!masks.empty()) {
+    llvm::dbgs() << "masks: ";
+    for (auto mask : masks)
+      llvm::dbgs() << "\t" << mask << "\n";
+  }
+  llvm::dbgs() << "\n";
 }
 
 LogicalResult MaskState::parseAdd(arith::AddIOp addOp, const Location loc,
@@ -283,17 +355,100 @@ LogicalResult MaskState::parseAdd(arith::AddIOp addOp, const Location loc,
 LogicalResult MaskState::parseAnd(arith::AndIOp andOp, const Location loc,
                                   OpBuilder &builder) {
   assert(this->isEmpty());
-
+  bool isBoolOp = false;
+  unsigned rank = 1;
+  if (auto shapedType = dyn_cast<ShapedType>(andOp.getType())) {
+    isBoolOp = shapedType.getElementType().isInteger(1);
+    rank = shapedType.getRank();
+  }
   MaskState lhsState;
-  if (failed(lhsState.parse(andOp.getLhs(), loc, builder)) ||
-      !lhsState.isMask())
+  LogicalResult lResult = lhsState.parse(andOp.getLhs(), loc, builder);
+  if (failed(lResult) && !isBoolOp) {
     return failure();
+  }
 
   MaskState rhsState;
-  if (failed(rhsState.parse(andOp.getRhs(), loc, builder)) ||
-      !rhsState.isMask())
+  LogicalResult rResult = rhsState.parse(andOp.getRhs(), loc, builder);
+  if (failed(rResult) && !isBoolOp) {
     return failure();
+  }
 
+  if (isBoolOp) {
+    if (lhsState.masks.size() != rank) {
+      return failure();
+    }
+
+    if (lhsState.masks.size() != rhsState.masks.size()) {
+      return failure();
+    }
+
+    // merge the masks.
+    if (lhsState.masks.size() == rhsState.masks.size()) {
+      auto shapedType = cast<ShapedType>(andOp.getType());
+      assert(shapedType.hasStaticShape());
+      for (size_t i = 0; i < lhsState.masks.size(); i++) {
+        Value lhsV = lhsState.masks[i];
+        Value rhsV = rhsState.masks[i];
+        if (!lhsV && !rhsV) {
+          masks.push_back(nullptr);
+        } else {
+          uint32_t size = shapedType.getShape()[i];
+          auto structuredMaskToUnstructuredMask = [](MaskState state,
+                                                     unsigned dim,
+                                                     uint32_t size,
+                                                     OpBuilder &builder,
+                                                     Location loc) {
+            OpFoldResult ofr = state.isMask() ? state.dims[dim] : state.scalar;
+            if (auto intV = getIntAttr(ofr)) {
+              if (intV == size) {
+                // Full mask.
+                return Value();
+              }
+            }
+            auto targetTensorType =
+                RankedTensorType::get({size}, builder.getI32Type());
+            Value range =
+                builder
+                    .create<triton::MakeRangeOp>(loc, targetTensorType, 0, size)
+                    .getResult();
+            Value v = ofrToIndexValue(ofr, loc, builder);
+            v = builder
+                    .create<arith::IndexCastUIOp>(loc, builder.getI32Type(), v)
+                    .getResult();
+            v = builder.create<triton::SplatOp>(loc, targetTensorType, v)
+                    .getResult();
+            return builder
+                .create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, range, v)
+                .getResult();
+          };
+          if (!lhsV) {
+            lhsV = structuredMaskToUnstructuredMask(lhsState, i, size, builder,
+                                                    loc);
+          } else if (!rhsV) {
+            rhsV = structuredMaskToUnstructuredMask(rhsState, i, size, builder,
+                                                    loc);
+          }
+          if (!lhsV) {
+            masks.push_back(rhsV);
+            continue;
+          } else if (!rhsV) {
+            masks.push_back(lhsV);
+            continue;
+          }
+          // And the mask.
+          masks.push_back(builder.create<arith::AndIOp>(loc, lhsV, rhsV));
+        }
+      }
+      // Only support one unstructured mask.
+      if (getUnstructuredMasks().size() > 1) {
+        return failure();
+      }
+    }
+  }
+
+  if (!lhsState.isMask() || !rhsState.isMask()) {
+    return this->minStateScalar(lhsState, rhsState, loc, builder);
+  }
   return this->minStates(lhsState, rhsState, loc, builder);
 }
 
@@ -306,10 +461,53 @@ LogicalResult MaskState::parseExtSI(arith::ExtSIOp op, const Location loc,
 LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
                                   OpBuilder &builder) {
   assert(this->isEmpty());
-
+  int cmpOpDim = -1;
+  if (auto shapedType = dyn_cast<ShapedType>(cmpOp.getType())) {
+    for (unsigned r = 0; r < shapedType.getRank(); r++) {
+      if (shapedType.getShape()[r] != 1) {
+        if (cmpOpDim != -1) {
+          // This will happen when the cmp has more than one dimension with size
+          // larger than 1.
+          // Like a < b while both a and b are tensors with shape 2x2.
+          cmpOpDim = -1;
+          break;
+        }
+        cmpOpDim = r;
+      }
+    }
+    masks.clear();
+    for (unsigned r = 0; r < shapedType.getRank(); r++) {
+      masks.push_back(nullptr);
+    }
+    // If cmpOpDim == -1, parseCmp must fail later.
+    // Here just setup unstructured masks when cmpOpDim != -1.
+    if (cmpOpDim != -1) {
+      // Save cmpOp as unstructured mask for failure case, will recover it to
+      // nullptr later if success.
+      Value unstructuredMask = cmpOp;
+      if (shapedType.getRank() > 1) {
+        // If cmpOp is not 1D, collapse it to 1D.
+        auto flatType = RankedTensorType::get({shapedType.getShape()[cmpOpDim]},
+                                              shapedType.getElementType());
+        auto maybeReassociationMap =
+            getReassociationIndicesForReshape(shapedType, flatType);
+        SmallVector<ReassociationIndices> reassociation =
+            *maybeReassociationMap;
+        // Set masks.
+        unstructuredMask = builder.create<tensor::CollapseShapeOp>(
+            loc, flatType, cmpOp, reassociation);
+      }
+      masks[cmpOpDim] = unstructuredMask;
+    }
+  } else {
+    cmpOpDim = 0;
+    masks.push_back(cmpOp);
+  }
   if (cmpOp.getPredicate() != arith::CmpIPredicate::slt &&
-      cmpOp.getPredicate() != arith::CmpIPredicate::ult) {
-    InFlightDiagnostic diag = emitError(loc) << "Unsupported cmpi";
+      cmpOp.getPredicate() != arith::CmpIPredicate::ult &&
+      cmpOp.getPredicate() != arith::CmpIPredicate::sge) {
+    LLVM_DEBUG(
+        { InFlightDiagnostic diag = emitRemark(loc, "Unsupported cmpi"); });
     return failure();
   }
 
@@ -321,40 +519,75 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
   if (failed(rhsState.parse(cmpOp.getRhs(), loc, builder)))
     return failure();
 
-  assert((!lhsState.scalar && rhsState.scalar) && "Unsupported cmpi scenario");
+  // We only support sge against 0 for lower bounds. Dims already has an
+  // implicit assumption that the lower bound is 0, so if we see this, assume
+  // the comparison evaluates to true.
+  if (cmpOp.getPredicate() == arith::CmpIPredicate::sge &&
+      !(rhsState.scalar && hasConstZero(rhsState.scalar))) {
+    LLVM_DEBUG({
+      InFlightDiagnostic diag =
+          emitRemark(loc, "Unsupported cmpi with rhs not equal to 0");
+    });
+    return failure();
+  }
 
-  int32_t cmpDim = -1;
+  int32_t cmpDim = lhsState.scalar && rhsState.scalar ? 0 : -1;
   for (int32_t i = 0; i < lhsState.getRank(); i++) {
     auto dimIntAttr = getIntAttr(lhsState.dims[i]);
     if (!dimIntAttr || dimIntAttr.value() != 1) {
       if (cmpDim != -1) {
-        InFlightDiagnostic diag = emitError(loc)
-                                  << "Unsupported cmpi with more than one "
-                                     "dimension with size larger than 1";
+        LLVM_DEBUG({
+          InFlightDiagnostic diag =
+              emitRemark(loc, "Unsupported cmpi with more than one dimension "
+                              "with size larger than 1");
+        });
         return failure();
       }
       cmpDim = i;
     }
   }
-  assert(cmpDim != -1 &&
-         "Unexpected case where no dimension has size larger than 1");
+  assert(
+      cmpDim != -1 ||
+      (!lhsState.scalar && cmpOp.getPredicate() == arith::CmpIPredicate::slt ||
+       cmpOp.getPredicate() == arith::CmpIPredicate::ult) &&
+          "Unexpected case where no dimension has size larger than 1");
 
-  // Important:
-  // In the case where the values we are loading are entirely masked off like
-  // the following:
-  //
-  // ---|-------|-----------|
-  //    ^       ^           ^
-  //   scalar  start       end
-  //
-  // newEnd = min(end, scalar) = scalar
-  // Now scalar < start, so simply doing dim = newEnd - start is incorrect.
-  //
-  // The correct formula is to optionally move `newDim` back to `start` using
-  // max(newEnd, start).
-  auto newEnd = minOFRs(lhsState.end, rhsState.scalar, loc, builder);
-  newEnd = maxOFRs(newEnd, lhsState.start, loc, builder);
-  auto newDim = subOFRs(newEnd, lhsState.start, loc, builder);
+  OpFoldResult newDim;
+  if (lhsState.scalar) {
+    assert(rhsState.scalar && "Unexpected case where rhs is not a scalar");
+    // If both lhs and rhs are scalars, we can't just derive the dimension of
+    // the mask as the minimum value: lhs/rhs could be 0 and then we don't
+    // load/store anything.
+    //
+    // Instead treat the comparison as a scalar that determines if anything
+    // should be loaded/stored by inserting a comparison + select:
+    //    dim = lhs < rhs ? lhs.dim : 0
+    newDim = compareOFRs(lhsState.scalar, rhsState.scalar, cmpOp.getPredicate(),
+                         lhsState.dims[cmpDim], builder.getIndexAttr(0), loc,
+                         builder);
+  } else if (cmpOp.getPredicate() == arith::CmpIPredicate::slt ||
+             cmpOp.getPredicate() == arith::CmpIPredicate::ult) {
+    // Important:
+    // In the case where the values we are loading are entirely masked off like
+    // the following:
+    //
+    // ---|-------|-----------|
+    //    ^       ^           ^
+    //   scalar  start       end
+    //
+    // newEnd = min(end, scalar) = scalar
+    // Now scalar < start, so simply doing dim = newEnd - start is incorrect.
+    //
+    // The correct formula is to optionally move `newDim` back to `start` using
+    // max(newEnd, start).
+    auto newEnd = minOFRs(lhsState.end, rhsState.scalar, loc, builder);
+    newEnd = maxOFRs(newEnd, lhsState.start, loc, builder);
+    newDim = subOFRs(newEnd, lhsState.start, loc, builder);
+  } else {
+    assert(cmpOp.getPredicate() == arith::CmpIPredicate::sge &&
+           rhsState.scalar && hasConstZero(rhsState.scalar));
+    newDim = lhsState.dims[cmpDim];
+  }
 
   for (int32_t i = 0; i < lhsState.getRank(); i++) {
     if (i == cmpDim)
@@ -362,7 +595,10 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
     else
       this->dims.push_back(lhsState.dims[i]);
   }
-
+  if (cmpOpDim != -1) {
+    // Clear masks when success.
+    masks[cmpOpDim] = nullptr;
+  }
   return success();
 }
 
@@ -386,31 +622,70 @@ LogicalResult MaskState::parseLoopIterArg(Value v, const Location loc,
     return failure();
   }
 
+  // This is a bit of a hack!!
+  //
+  // The offset (MaskState::start) of a mask can now depend on a loop's
+  // iter-arg like the following example:
+  //
+  // idx = offset + tl.arange(0, 4)
+  // for it in range(n):
+  //   mask = idx < size
+  //   x = tl.load(x_ptr + idx, mask=mask)
+  //   tl.store(y_ptr + idx, x, mask=mask)
+  //   idx += 4
+  //
+  // See
+  // test/Conversion/TritonToStructured/mask_loop_iter_arg.mlir and
+  // and
+  // python/examples/test_mask_loop_iter_arg.py
+  // for IR and full triton code.
+  //
+  // To support this case, we first make the following assumptions:
+  //  - MaskAnalysis is runs after PtrAnalysis's prepass finishes, which means
+  //    the offset for the load and store pointers have already been set up
+  //    at `argIndex + 1`
+  //  - The tensor of indices used by the load / store and the mask are the same
+  //    (see above where `idx` appears in both the mask and the pointer
+  //    arithmetic). This allows us to use the offset at `argIndex + 1` in the
+  //    above assumption. In the future, to make this more robust, we need to
+  //    verify that the offsets are indeed the same. Or alternatively, make sure
+  //    to generate a separate start and end offset for each mask that is being
+  //    updated in loops.
+  //
+  // Now to generate the mask state in each loop iteration, we first construct
+  // the mask state *before* coming into the loop by parsing the init-arg. A
+  // mask dimensions stay consistent throughout each loop iteration, but its
+  // starting offset (`MaskState::start`) will change. So to construct the mask
+  // state for each iteration, we need to make MaskState::state be the offset
+  // iter-arg at `argIndex + 1`. Now for `MaskState::end`, we can first compute
+  // the distance between `start` and `end` before coming into the loop, then
+  // use this distance to compute the actual `end` in each loop.
   auto argIndex = std::distance(forOp.getRegionIterArgs().begin(), it);
   auto initArg = forOp.getInitArgs()[argIndex];
   if (auto getStateOp = initArg.getDefiningOp<tts::GetStructuredStateOp>()) {
     auto tritonValue = getStateOp->getOperand(0);
     MaskState lhsState;
-    if (failed(lhsState.parse(tritonValue, loc, builder))) {
-      return failure();
+
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      // Make sure all ops generated for the mask state are inserted before
+      // the current loop
+      builder.setInsertionPoint(forOp);
+      if (failed(lhsState.parse(tritonValue, loc, builder))) {
+        return failure();
+      }
     }
 
-    // This is a bit of a hack!!
-    //
-    // The offsets and dimensions of a MaskState can now depend on a loop's
-    // iter-arg.
-    //
-    // Because the PtrAnalysis's pre-pass already sets up the offsets,
-    // we can create a new MaskState for each loop iteration by adding the
-    // original MaskState with the current iter-arg, which is at `argIndex +
-    // 1`.
-    //
-    // This will not work for nested loop scenarios, which would need a
-    // more robust implementation.
-    if (failed(this->addStateScalar(
-            lhsState, forOp.getRegionIterArgs()[argIndex + 1], loc, builder))) {
-      return failure();
+    if (!lhsState.start && !lhsState.end) {
+      assert(lhsState.scalar && "MaskState must have a scalar");
+      lhsState.start = builder.getIndexAttr(0);
+      lhsState.end = lhsState.scalar;
     }
+
+    auto dist = subOFRs(lhsState.end, lhsState.start, loc, builder);
+    this->start = forOp.getRegionIterArg(argIndex + 1);
+    this->end = addOFRs(this->start, dist, loc, builder);
+    this->dims = lhsState.dims;
 
     return success();
   }
@@ -429,10 +704,11 @@ LogicalResult MaskState::parseMakeRange(triton::MakeRangeOp rangeOp,
   auto stride = (end - start + shape[0] - 1) / shape[0];
 
   if (stride != 1) {
-    InFlightDiagnostic diag =
-        emitError(loc)
-        << "stride must be 1 for make_range whose result is used "
-           "as load or store masks";
+    LLVM_DEBUG({
+      InFlightDiagnostic diag = emitRemark(
+          loc, "stride must be 1 for make_range whose result is used "
+               "as load or store masks");
+    });
     return failure();
   }
 
@@ -482,9 +758,10 @@ LogicalResult MaskState::parseSplat(triton::SplatOp splatOp, const Location loc,
   auto dstShape = cast<ShapedType>(dst.getType()).getShape();
 
   if (!isa<IntegerType>(src.getType())) {
-    InFlightDiagnostic diag =
-        emitError(loc)
-        << "splat source must be an integer scalar for load/store masks";
+    LLVM_DEBUG({
+      InFlightDiagnostic diag = emitRemark(
+          loc, "splat source must be an integer scalar for load/store masks");
+    });
     return failure();
   }
 
@@ -493,7 +770,15 @@ LogicalResult MaskState::parseSplat(triton::SplatOp splatOp, const Location loc,
 
   for (auto s : dstShape)
     this->dims.push_back(builder.getIndexAttr(s));
-
+  bool isBool = src.getType().isInteger(1);
+  if (isBool) {
+    // If src is a 1D boolean tensor and parse success.
+    // Create masks.
+    masks.clear();
+    for (unsigned i = 0; i < dstShape.size(); i++) {
+      masks.push_back(nullptr);
+    }
+  }
   return success();
 }
 
@@ -502,17 +787,75 @@ LogicalResult MaskState::parseExpandDims(triton::ExpandDimsOp expandDimsOp,
                                          OpBuilder &builder) {
   assert(this->isEmpty());
 
-  if (failed(this->parse(expandDimsOp.getSrc(), loc, builder)))
-    return failure();
-
   auto dstShape =
       cast<ShapedType>(expandDimsOp.getResult().getType()).getShape();
   auto axis = expandDimsOp.getAxis();
+  Value src = expandDimsOp.getSrc();
+  auto srcType = cast<ShapedType>(src.getType());
+  bool isBoolOp = srcType.getElementType().isInteger(1);
+  LogicalResult result = parse(src, loc, builder);
+  if (failed(result)) {
+    if (isBoolOp) {
+      if (srcType.getRank() > 1 && masks.size() != srcType.getRank()) {
+        return failure();
+      }
+    } else {
+      return failure();
+    }
+  }
+
+  if (isBoolOp) {
+    // Save mask for 1D boolean tensor
+    if (srcType.getRank() == 1) {
+      assert(dstShape.size() == 2);
+      masks.resize(dstShape.size());
+      masks[axis] = nullptr;
+      if (failed(result)) {
+        // Recover dims to allow other dim to be processed.
+        dims.clear();
+        dims.push_back(builder.getIndexAttr(srcType.getShape()[0]));
+        // Save src as unstructured mask.
+        masks[1 - axis] = src;
+      } else {
+        // save nullptr when parse success.
+        masks[1 - axis] = nullptr;
+      }
+    } else {
+      if (failed(result)) {
+        auto unstructuredMasks = getUnstructuredMasks();
+        if (unstructuredMasks.empty()) {
+          return failure();
+        }
+        if (unstructuredMasks.size() > 1) {
+          return failure();
+        }
+        auto [dim, mask] = unstructuredMasks.front();
+        // Recover dims for unstructured mask dim to allow other dim to be
+        // processed.
+        dims[dim] = builder.getIndexAttr(srcType.getShape()[dim]);
+      }
+      masks.insert(masks.begin() + axis, nullptr);
+    }
+  }
+
   assert(dstShape[axis] == 1 &&
          "expect changed dimension to be 1 in expand_dims");
   this->dims.insert(this->dims.begin() + axis, builder.getIndexAttr(1));
 
   return success();
+}
+
+// Return all non-nullptr masks along with their dimensions.
+SmallVector<std::pair<unsigned, Value>> MaskState::getUnstructuredMasks() {
+  SmallVector<std::pair<unsigned, Value>> result;
+
+  for (auto [i, m] : llvm::enumerate(masks)) {
+    if (m) {
+      result.push_back({i, m});
+    }
+  }
+
+  return result;
 }
 
 } // namespace triton

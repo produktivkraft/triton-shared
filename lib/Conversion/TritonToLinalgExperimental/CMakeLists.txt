@@ -6,6 +6,9 @@
 
 add_triton_library(TritonToLinalgExperimental
   TritonToLinalgExperimentalPass.cpp
+  ReconcilePtrCastsPass.cpp
+  TritonToPtrPass.cpp
+  CollapseShape.cpp
 
   DEPENDS
   TritonToLinalgExperimentalConversionPassIncGen
@@ -20,12 +23,16 @@ add_triton_library(TritonToLinalgExperimental
   MLIRTensorDialect
   MLIRTransforms
   MLIRSupport
-  TritonAnalysis
+  TPtrIR
   TritonIR
   TritonTransforms
   TritonSharedAnalysis
+  TritonSharedUtils
 
   TritonArithToLinalg
   StructuredToMemref
   TritonToStructured
+  TritonToUnstructured
+  TritonPtrToMemref
+  UnstructuredToMemref
 )

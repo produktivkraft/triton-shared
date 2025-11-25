@@ -38,8 +38,18 @@ const extern std::string ptrAnalysisAttr;
 // shape field means the same field as tt.make_tensor_ptr; when it describes a
 // non-block pointer, shape field indicates how address wraps around (i.e.,
 // modulo); a constant 0 indicates no modulo for the dimension.
+// Multi-dimension PtrState, which has one unstructured dimension, is supported
+// for gather/scatter access. The unstructured dimension is marked by a tensor
+// type offset. The tensor offset for the unstructured dimension must be
+// expanded from a 1D tensor. The analysis will fail for multi-dimension
+// unstructured offsets. Later, when using the tensor offset to calculate the
+// address, it will be collapsed to 1D. To support gather/scatter access, treat
+// the unstructured offset as a whole offset instead of decoding the pointer
+// arithmetic on it except scalar mul.
+// The stride is set to 1 when there's no scalar mul so it still matches the
+// offset * stride formula. When there're scalar muls, the stride is set to the
+// multiplication of all the scalar strides.
 struct PtrState {
-
   SmallVector<OpFoldResult> offsets;
   SmallVector<OpFoldResult> sizes;
   SmallVector<OpFoldResult> strides;
@@ -57,18 +67,65 @@ struct PtrState {
 
   bool dimHasModulo(uint32_t dim) const;
 
+  bool dimIsStructured(uint32_t dim) const;
+  int32_t getNonStructuredDim() const;
+  // Verify that all dimensions are not structured.
+  bool noStructuredDimExists() const;
+
+  bool isStructured() const;
+
   bool isBlockPtr() const;
+
+  void dump() const;
+
+  // For unsupported op, save the op to the state.
+  LogicalResult rebuildAsUnsupportedOp(Value op);
+
+  // When merge with other state which is not structured, set the nonContinuous
+  // dimension offset as op.
+  // Fail if the operation already mixes different dimensions.
+  // For case
+  // clang-format off
+  //    %14 = tt.expand_dims %11 {axis = 1 : i32} : tensor<64xi1> -> tensor<64x1xi1>
+  //    %dim0_value = tt.broadcast %14 : tensor<64x1xi1> -> tensor<64x64xi1>
+  //    %16 = tt.expand_dims %13 {axis = 0 : i32} : tensor<64xi1> -> tensor<1x64xi1>
+  //    %dim1_value = tt.broadcast %16 : tensor<1x64xi1> -> tensor<64x64xi1>
+  //    add  %dim0_value, %dim1_value
+  // clang-format on
+  //    the add will have size > 1 for both dim0 and dim1.
+  //    It will fail for mix of different dims.
+  //
+  // Fail if the operation does not contribute to nonContinuousDim.
+  // For case
+  // clang-format off
+  //    %14 = tt.expand_dims %11 {axis = 1 : i32} : tensor<64xi1> -> tensor<64x1xi1>
+  //    %dim0_value = tt.broadcast %14 : tensor<64x1xi1> -> tensor<64x64xi1>
+  //    %16 = tt.expand_dims %13 {axis = 1 : i32} : tensor<64xi1> -> tensor<64x1xi1>
+  //    %dim0_value2 = tt.broadcast %16 : tensor<64x1xi1> -> tensor<64x64xi1>
+  //    add  %dim0_value, %dim0_value2
+  // clang-format on
+  //    the add only have size > 1 for dim0 which doesn't mix of different
+  //    dims.
+  // But if call rebuildAsGatherScatter on the add with nonContinuousDim = 1 it
+  // will fail because it only have dim0.
+  LogicalResult rebuildAsGatherScatter(Value op, int nonContinuousDim);
 
   // Process addition of two PtrStates.
   LogicalResult addState(const PtrState &lhsState, const PtrState &rhsState,
-                         Operation *op, OpBuilder &builder);
+                         bool isAnalysisingUnstructured, Operation *op,
+                         OpBuilder &builder);
 
   // Process multiplication of two PtrStates
   LogicalResult mulState(const PtrState &lhsState, const PtrState &rhsState,
-                         Operation *op, OpBuilder &builder);
+                         bool isAnalysisingUnstructured, Operation *op,
+                         OpBuilder &builder);
+
+  LogicalResult mergeUnstructuredState(const PtrState &other, Operation *op);
 
   tts::MakeTensorPtrOp createTTSMakeTensorPtrOp(OpBuilder &builder,
                                                 Location loc);
+  tts::MakeGatherScatterTensorPtrOp
+  createTTSMakeGatherScatterTensorPtrOp(OpBuilder &builder, Location loc);
 };
 
 class PtrAnalysis {
@@ -93,8 +150,46 @@ class PtrAnalysis {
       llvm::function_ref<Value(scf::ForOp op, size_t)> getReplacementVal);
 
   DenseSet<Value> maybeStructuredArgs;
+  const bool enableMakeGatherScatterTensorPtr;
+  // If false, PtrAnalysis will analysis structured ptr while only identify
+  // unstructured ptr.
+  // If true, PtrAnalysis will caclulate strides and offsets for
+  // unstructured pointers. This is used to support gather/scatter access.
+  // The default mode is false. Only set to true when caclulating
+  // unstructured pointers for gather/scatter access.
+  // The reason to have different mode is to support case like:
+  //
+  // ptr + (row_offsets[:,None] % mod_offset + some_number) +
+  //    row_indices[:None]
+  //
+  // (row_offsets[:,None] % mod_offset + some_number) is structured and
+  // has modulo.
+  // row_indices[:, None] is unstructured.
+  // When visiting the add operation, we need to apply the modulo to
+  //   (row_offsets[:,None] % mod_offset + some_number).
+  // But we don't have the information about how to apply the modulo.
+  //
+  // To simplify the analysis, we do the work in two modes:
+  // 1. Analyze to identify the unstructured pointers.
+  // 2. Analyze to calculate the strides and offsets for unstructured pointers.
+  // In mode 1, isAnalysisingUnstructured is set to false, so we only
+  //    identify the unstructured pointers and do not calculate the strides and
+  //    offsets.
+  // When visit the operand again to calculate the offsets and strides for the
+  // unstructured state, we'll set isAnalysisingUnstructured to true.
+  // This means that we switched to mode 2 now and are analyzing the
+  // unstructured pointers and calculating the strides and offsets for them. In
+  // mode 2, we know that the pointer is unstructured, so we can just use the
+  // value of arith::RemSIOp as offset directly. Once the analysis is done,
+  // we'll switch back to mode 1.
+  //
+  // Note that this is might be a temporary solution, and we may need to
+  // revisit this in the future to support more complex cases.
+  bool isAnalysisingUnstructured = false;
 
 public:
+  PtrAnalysis(bool enableMakeGatherScatterTensorPtr)
+      : enableMakeGatherScatterTensorPtr(enableMakeGatherScatterTensorPtr) {}
   void initializeMaybeStructuredArgs(Operation *op);
 
   llvm::SmallDenseMap<Value, PtrState> knownPtrs;
@@ -222,6 +317,20 @@ public:
   LogicalResult visitOperandMakeTensorPtr(triton::MakeTensorPtrOp makeTPtrOp,
                                           PtrState &state, const Location loc,
                                           OpBuilder &builder);
+
+  // Operand is the result of tt.int_to_ptr.
+  // Expected result:
+  //  Directly grab op result
+  LogicalResult visitOperandIntToPtr(triton::IntToPtrOp intToPtrOp,
+                                     PtrState &state, const Location loc,
+                                     OpBuilder &builder);
+
+  // Operand is the result of tt.bitcast.
+  // Expected result:
+  //  Directly grab op result
+  LogicalResult visitOperandBitcast(triton::BitcastOp bitcastOp,
+                                    PtrState &state, const Location loc,
+                                    OpBuilder &builder);
 
   // Get the computed PtrState for the forOp's init-arg at the provided index.
   FailureOr<PtrState> getLoopInitArgPtrState(scf::ForOp forOp, size_t index);

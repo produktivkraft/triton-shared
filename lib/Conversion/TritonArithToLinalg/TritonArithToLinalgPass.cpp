@@ -6,15 +6,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #include "triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h"
+#include "triton-shared/Utils/Utils.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -73,6 +75,19 @@ class TritonArithToLinalgPass
     }
   }
 
+  LogicalResult applyTensorConcatDecomposition() {
+    auto moduleOp = getOperation();
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+
+    tensor::populateDecomposeTensorConcatPatterns(patterns);
+
+    if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
+      return failure();
+    }
+    return success();
+  }
+
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
@@ -89,7 +104,7 @@ public:
     {
       RewritePatternSet patterns(&getContext());
       populateTritonArithToLinalgCanonicalizationPatterns(patterns);
-      if (failed(applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
         signalPassFailure();
       }
     }
@@ -144,12 +159,35 @@ public:
       });
     }
 
+    target.addDynamicallyLegalOp<triton::BitcastOp>(
+        [this](triton::BitcastOp op) {
+          if (!tensorPtrToLinalg) {
+            return triton::isPtrTypeLike(op.getType());
+          } else {
+            if (triton::isPtrTypeLike(op.getType())) {
+              return !isa<ShapedType>(op.getType());
+            }
+            return false;
+          }
+        });
+
+    // TODO: Might want to consolidate this flag with addptrToLinalg later.
+    if (tensorPtrToLinalg) {
+      target.addDynamicallyLegalOp<triton::LoadOp, triton::StoreOp,
+                                   triton::IntToPtrOp, triton::PtrToIntOp>(
+          [](auto op) {
+            return !isa<ShapedType>(op->getOperands()[0].getType());
+          });
+      populateTritonTensorPtrConversionPatterns(patterns);
+    }
+
     if (!assertToCf) {
       target.addLegalOp<triton::AssertOp>();
     }
 
     triton::populateTritonArithToLinalgConversionPatterns(
-        pidsToFuncArgs, addptrToLinalg, assertToCf, patterns);
+        pidsToFuncArgs, addptrToLinalg, assertToCf, transposeReduceToRank0,
+        patterns);
 
     if (pidsToFuncArgs) {
       for (auto func : getOperation().getOps<triton::FuncOp>()) {
@@ -158,6 +196,10 @@ public:
     }
 
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
+      signalPassFailure();
+    }
+
+    if (failed(applyTensorConcatDecomposition())) {
       signalPassFailure();
     }
 
@@ -174,6 +216,8 @@ public:
         func.getAllResultAttrs(resAttrs);
 
         auto funcFunc = builder.create<func::FuncOp>(func.getLoc(), name, type);
+        // Preserve the visibility attribute
+        funcFunc.setVisibility(func.getVisibility());
         funcFunc.setAllArgAttrs(argAttrs);
         funcFunc.setAllResultAttrs(resAttrs);
 
@@ -203,6 +247,10 @@ public:
 } // namespace
 
 std::unique_ptr<OperationPass<ModuleOp>>
-triton::createTritonArithToLinalgPass() {
-  return std::make_unique<TritonArithToLinalgPass>();
+triton::createTritonArithToLinalgPass(bool tensorPtrToLinalg,
+                                      bool transposeReduceToRank0) {
+  TritonArithToLinalgOptions options;
+  options.tensorPtrToLinalg = tensorPtrToLinalg;
+  options.transposeReduceToRank0 = transposeReduceToRank0;
+  return std::make_unique<TritonArithToLinalgPass>(options);
 }

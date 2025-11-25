@@ -8,11 +8,8 @@
 #include "triton-shared/AnalysisStructured/PtrAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Utils/StaticValueUtils.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
-#include "mlir/IR/ValueRange.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
@@ -26,6 +23,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
@@ -33,82 +31,101 @@
 #include "llvm/Support/LogicalResult.h"
 #include <cassert>
 #include <cstddef>
-#include <functional>
 #include <optional>
 #include <queue>
 #include <string>
 
 #define DEBUG_TYPE "triton-ptr-analysis"
 
-namespace mlir {
+using namespace mlir;
 
-// Extract a scalar value from v.
-// If v is a scalar, return that directly. Otherwise, parse through operations
-// (currently only support splat, sitofp, and truncf) that produce it to
-// extract the underlying scalar value. We then reconstruct the chain of
-// operations that can produce this constant with the original type. If no
-// scalar value can be extracted, a nullptr is returned.
-static Value getScalarValue(Value operand, Location loc, OpBuilder &builder) {
-  SmallVector<Operation *> ops;
+// Try to apply unstructured mask on the ptr.
+static Value applyUnstructuredMask(Operation *op, Value ptr,
+                                   triton::MaskState &mstate, Location loc,
+                                   OpBuilder builder) {
+  SmallVector<std::pair<unsigned, Value>> masks = mstate.getUnstructuredMasks();
+  if (masks.empty()) {
+    return ptr;
+  }
+  if (masks.size() > 1) {
+    LLVM_DEBUG(op->emitRemark(
+        "MaskAnalysis failed for more than one unstructured masks"));
+    return nullptr;
+  }
 
-  auto reconstructScalarValue = [&](Value src) {
-    for (auto op = ops.rbegin(); op != ops.rend(); ++op) {
-      src = TypeSwitch<Operation *, Value>(*op)
-                .Case<arith::SIToFPOp>([&](Operation *op) {
-                  auto resType = op->getResults()[0].getType();
-                  if (auto shapedType = dyn_cast<ShapedType>(resType)) {
-                    resType = shapedType.getElementType();
-                  }
-                  return builder.create<arith::SIToFPOp>(loc, resType, src);
-                })
-                .Case<arith::TruncFOp>([&](Operation *op) {
-                  auto resType = op->getResults()[0].getType();
-                  if (auto shapedType = dyn_cast<ShapedType>(resType)) {
-                    resType = shapedType.getElementType();
-                  }
-                  return builder.create<arith::TruncFOp>(loc, resType, src);
-                })
-                .Default([](Operation *op) {
-                  llvm_unreachable("unsupported op in generating ");
-                  return nullptr;
-                });
-    }
-    return src;
-  };
-
-  while (true) {
-    if (!dyn_cast<ShapedType>(operand.getType())) {
-      return reconstructScalarValue(operand);
-    } else if (auto op = operand.getDefiningOp<arith::ConstantOp>()) {
-      if (auto attr = dyn_cast<DenseElementsAttr>(op.getValue())) {
-        if (!attr.isSplat()) {
-          InFlightDiagnostic diag = emitError(loc)
-                                    << "other value used in masked load "
-                                       "produced by unsupported instruction";
-          return nullptr;
-        }
-        auto elemValue = attr.getSplatValue<Attribute>();
-        auto constOp = arith::ConstantOp::materialize(
-            builder, elemValue, attr.getElementType(), op.getLoc());
-        return reconstructScalarValue(constOp.getResult());
-      }
-    } else if (auto op = operand.getDefiningOp<triton::SplatOp>()) {
-      operand = op.getSrc();
-    } else if (auto op = operand.getDefiningOp<arith::SIToFPOp>()) {
-      ops.push_back(op.getOperation());
-      operand = op.getIn();
-    } else if (auto op = operand.getDefiningOp<arith::TruncFOp>()) {
-      ops.push_back(op.getOperation());
-      operand = op.getIn();
-    } else {
-      InFlightDiagnostic diag = emitError(loc)
-                                << "other value used in masked load produced "
-                                   "by unsupported instruction";
+  auto [dim, unstructuredMask] = masks[0];
+  if (auto gatherScatterPtr =
+          ptr.getDefiningOp<tts::MakeGatherScatterTensorPtrOp>()) {
+    if (dim != gatherScatterPtr.getGatherScatterDim()) {
+      LLVM_DEBUG(op->emitRemark(
+          "MaskAnalysis failed for unstructured mask dim not equal "
+          "gather scatter dim"));
       return nullptr;
     }
+
+    ptr =
+        builder
+            .create<tts::MakeGatherScatterTensorPtrOp>(
+                loc, gatherScatterPtr.getBase(),
+                gatherScatterPtr.getGatherScatterOffset(), unstructuredMask,
+                gatherScatterPtr.getGatherScatterDim(),
+                gatherScatterPtr.getSizes(), gatherScatterPtr.getMixedStrides(),
+                gatherScatterPtr.getMixedOffsets())
+            .getResult();
+  } else if (auto structuredPtr = ptr.getDefiningOp<tts::MakeTensorPtrOp>()) {
+    auto ofrToI32Value = [&](OpFoldResult ofr) {
+      Value v = dyn_cast<Value>(ofr);
+      if (!v) {
+        v = builder
+                .create<arith::ConstantOp>(
+                    loc, cast<TypedAttr>(cast<Attribute>(ofr)))
+                .getResult();
+      }
+      if (isa<IndexType>(v.getType())) {
+        v = builder.create<arith::IndexCastOp>(loc, builder.getI32Type(), v)
+                .getResult();
+      } else if (v.getType().isInteger(64)) {
+        v = builder.create<arith::TruncIOp>(loc, builder.getI32Type(), v)
+                .getResult();
+      }
+
+      return v;
+    };
+    OpFoldResult offsetFold = structuredPtr.getMixedOffsets()[dim];
+    Value offset = ofrToI32Value(offsetFold);
+    auto offsetRowType = RankedTensorType::get({structuredPtr.getSizes()[dim]},
+                                               offset.getType());
+    OpFoldResult strideFold = structuredPtr.getMixedStrides()[dim];
+    Value stride = ofrToI32Value(strideFold);
+    // Divide stride since offset of tts::MakeTensorPtrOp already include the
+    // stride, but gatherScatterOffset of tts::MakeGatherScatterTensorPtrOp
+    // should not include stride.
+    offset = builder.create<arith::DivUIOp>(loc, offset, stride);
+
+    Value gatherScatterOffset =
+        builder.create<tensor::SplatOp>(loc, offsetRowType, offset).getResult();
+    Value range = builder
+                      .create<triton::MakeRangeOp>(
+                          loc, offsetRowType, 0, structuredPtr.getSizes()[dim])
+                      .getResult();
+    gatherScatterOffset =
+        builder.create<arith::AddIOp>(loc, gatherScatterOffset, range);
+    ptr = builder
+              .create<tts::MakeGatherScatterTensorPtrOp>(
+                  loc, structuredPtr.getBase(), gatherScatterOffset,
+                  unstructuredMask, dim, structuredPtr.getSizes(),
+                  structuredPtr.getMixedStrides(),
+                  structuredPtr.getMixedOffsets())
+              .getResult();
+  } else {
+    return nullptr;
   }
-  return nullptr;
+  // Clear the mask size for gather/scatter dim.
+  mstate.dims[dim] = OpFoldResult(builder.getI32IntegerAttr(0));
+  return ptr;
 }
+
+namespace mlir {
 
 namespace tts {
 
@@ -146,18 +163,127 @@ bool PtrState::dimHasModulo(uint32_t dim) const {
   return intAttr.value() != 0;
 }
 
+bool isNotStructured(OpFoldResult offset) {
+  auto value = dyn_cast<Value>(offset);
+  return value && isa<ShapedType>(value.getType());
+}
+
+bool PtrState::dimIsStructured(uint32_t dim) const {
+  assert(dim < getRank());
+
+  return !isNotStructured(offsets[dim]);
+}
+
+int32_t PtrState::getNonStructuredDim() const {
+  SmallVector<int32_t> dims;
+  for (int32_t i = 0; i < getRank(); i++) {
+    if (dimIsStructured(i))
+      continue;
+    dims.emplace_back(i);
+  }
+  assert(dims.size() == 1 && "must have single non-continuous dimension");
+  return dims.front();
+}
+
+bool PtrState::noStructuredDimExists() const {
+  return getRank() > 0 && llvm::all_of(offsets, [](OpFoldResult offset) {
+           return isNotStructured(offset);
+         });
+}
+
+bool PtrState::isStructured() const {
+  return llvm::all_of(
+      offsets, [](OpFoldResult offset) { return !isNotStructured(offset); });
+}
+
 bool PtrState::isBlockPtr() const { return !order.empty(); }
 
+bool isNotSingleDim(Value v) {
+  auto shapedTy = dyn_cast<ShapedType>(v.getType());
+  if (!shapedTy)
+    return false;
+  auto valShape = shapedTy.getShape();
+
+  // Make sure there are more than 1 dimensions with size > 1.
+  return llvm::find_singleton<int64_t>(
+             valShape,
+             [](int64_t size, bool) {
+               return size > 1 ? (int64_t *)size : nullptr;
+             },
+             false) == nullptr;
+}
+
+LogicalResult PtrState::rebuildAsUnsupportedOp(Value operand) {
+  if (isNotSingleDim(operand))
+    return failure();
+
+  if (!isEmpty())
+    return failure();
+
+  // Scalar has been take care early.
+  // Assume here must be shape type.
+  auto opType = cast<ShapedType>(operand.getType());
+  // Skip support for pointer types which could be source of PtrState.
+  // This check avoids creating a PtrState with non-structured source.
+  if (isa<triton::PointerType>(opType.getElementType()))
+    return failure();
+
+  auto opShape = opType.getShape();
+
+  // Setup state for unsupported operation.
+  auto indexTy = IndexType::get(operand.getContext());
+  auto index0 = IntegerAttr::get(indexTy, APInt(64, 0));
+  auto index1 = IntegerAttr::get(indexTy, APInt(64, 1));
+  for (auto size : opShape) {
+    if (size == 1) {
+      offsets.push_back(index0);
+      strides.push_back(index0);
+    } else {
+      offsets.push_back(operand);
+      strides.push_back(index1);
+    }
+    sizes.push_back(IntegerAttr::get(indexTy, APInt(64, size)));
+    shape.push_back(index0);
+  }
+  return success();
+}
+
+LogicalResult PtrState::rebuildAsGatherScatter(Value op, int nonContinuousDim) {
+  if (isNotSingleDim(op))
+    return failure();
+  if (nonContinuousDim >= getRank())
+    return failure();
+
+  // Scalar has been take care early.
+  // Assume here must be shape type.
+  auto opShape = cast<ShapedType>(op.getType()).getShape();
+  // Make sure the op only contribute to nonContinuousDim by check
+  // nonContinuousDim is the dimension with size > 1.
+  if (opShape[nonContinuousDim] <= 1)
+    return failure();
+
+  // Setup state for nonContinuousDim.
+  auto indexTy = IndexType::get(op.getContext());
+  auto index0 = IntegerAttr::get(indexTy, APInt(64, 0));
+  auto index1 = IntegerAttr::get(indexTy, APInt(64, 1));
+
+  offsets[nonContinuousDim] = op;
+  strides[nonContinuousDim] = index1;
+  shape[nonContinuousDim] = index0;
+  return success();
+}
+
 LogicalResult PtrState::addState(const PtrState &lhsState,
-                                 const PtrState &rhsState, Operation *op,
+                                 const PtrState &rhsState,
+                                 bool isAnalysisingUnstructured, Operation *op,
                                  OpBuilder &builder) {
   assert(isEmpty() && lhsState.getRank() == rhsState.getRank());
   auto loc = op->getLoc();
 
   if (lhsState.source && rhsState.source) {
-    op->emitRemark(
+    LLVM_DEBUG(op->emitRemark(
         "PtrAnalysis: do not support adding two pointer states that both "
-        "have base pointers");
+        "have base pointers"));
     return failure();
   }
 
@@ -171,22 +297,139 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
     scalar = lhsState.scalar ? lhsState.scalar : rhsState.scalar;
   }
 
-  for (uint64_t i = 0; i < lhsState.getRank(); i++) {
-    auto newOffset =
-        addOFRs(lhsState.offsets[i], rhsState.offsets[i], loc, builder);
-    offsets.push_back(newOffset);
+  if (!lhsState.isStructured() && !rhsState.isStructured()) {
+    if (lhsState.getNonStructuredDim() != rhsState.getNonStructuredDim()) {
+      LLVM_DEBUG(op->emitRemark(
+          "PtrAnalysis: do not support adding two pointer states "
+          "that have different non-continuous dimension"));
+      return failure();
+    }
+  }
 
-    auto newStride =
-        addOFRs(lhsState.strides[i], rhsState.strides[i], loc, builder);
-    strides.push_back(newStride);
+  for (uint64_t i = 0; i < lhsState.getRank(); i++) {
+    if (lhsState.dimIsStructured(i) && rhsState.dimIsStructured(i)) {
+      auto newOffset =
+          addOFRs(lhsState.offsets[i], rhsState.offsets[i], loc, builder);
+      offsets.push_back(newOffset);
+      auto newStride =
+          addOFRs(lhsState.strides[i], rhsState.strides[i], loc, builder);
+      strides.push_back(newStride);
+    } else {
+      if (isAnalysisingUnstructured) {
+        assert(!lhsState.hasModulo() && !rhsState.hasModulo() &&
+               "should not have dimension with modulo when analysing "
+               "unstructured");
+        if (hasConstZero(lhsState.strides[i]) &&
+            hasConstZero(lhsState.offsets[i])) {
+          // If lhs is not for dim i, we can just use rhs's stride and offset.
+          offsets.push_back(rhsState.offsets[i]);
+          strides.push_back(rhsState.strides[i]);
+        } else if (hasConstZero(rhsState.strides[i]) &&
+                   hasConstZero(rhsState.offsets[i])) {
+          // If rhs is not for dim i, we can just use lhs's stride and offset.
+          offsets.push_back(lhsState.offsets[i]);
+          strides.push_back(lhsState.strides[i]);
+        } else {
+          OpFoldResult lhsOffset = lhsState.offsets[i];
+          OpFoldResult rhsOffset = rhsState.offsets[i];
+          OpFoldResult lhsStride = lhsState.strides[i];
+          OpFoldResult rhsStride = rhsState.strides[i];
+          // If stride is 0 which will happen after
+          // visitOperandExpandDims/visitOperandSplat, we set the stride to 1 to
+          // mul it with offset.
+          if (hasConstZero(lhsStride)) {
+            assert(lhsState.dimIsStructured(i) &&
+                   !rhsState.dimIsStructured(i) &&
+                   "If lhs stride is zero, it must be structured and rhs "
+                   "stride is unstructured");
+            lhsStride = builder.getIndexAttr(1);
+          }
+          if (hasConstZero(rhsStride)) {
+            assert(rhsState.dimIsStructured(i) &&
+                   !lhsState.dimIsStructured(i) &&
+                   "If rhs stride is zero, it must be structured and lhs "
+                   "stride is unstructured");
+            rhsStride = builder.getIndexAttr(1);
+          }
+
+          // If both offset and stride not equal, we merge 2 PtrStates by change
+          // offset * stride into (offset * stride) * 1 where new offset is
+          // offset * stride and new stride is set to 1.
+          // Then we'll have strides equal as 1, and merge them as PtrState with
+          // same strides.
+          if (lhsOffset != rhsOffset && lhsStride != rhsStride) {
+            // Expand offset since unstructured offset has tensor type.
+            OpFoldResult stride =
+                expandOFRIndex(lhsStride, lhsOffset, loc, builder);
+            // new offset = offset * stride
+            lhsOffset = mulOFRs(lhsOffset, stride, loc, builder);
+            // Expand offset since unstructured offset has tensor type.
+            stride = expandOFRIndex(rhsStride, rhsOffset, loc, builder);
+            // new offset = offset * stride
+            rhsOffset = mulOFRs(rhsOffset, stride, loc, builder);
+            // Set both strides to 1.
+            lhsStride = builder.getIndexAttr(1);
+            rhsStride = builder.getIndexAttr(1);
+          }
+
+          if (lhsStride == rhsStride) {
+            // For case like lhs_offset * stride + rhs_offset * stride, it is
+            // same as (lhs_offset + rhs_offset) * stride. We can just add the
+            // offsets and reuse the stride like this:
+            //   offsets[i] = lhsOffset + rhsOffset
+            //   strides[i] = lhsStride
+            // Expand structured offset since unstructured offset has tensor
+            // type.
+            if (!lhsState.dimIsStructured(i)) {
+              rhsOffset = expandOFRIndex(rhsOffset, lhsOffset, loc, builder);
+            } else {
+              lhsOffset = expandOFRIndex(lhsOffset, rhsOffset, loc, builder);
+            }
+            // Add offsets.
+            offsets.push_back(addOFRs(lhsOffset, rhsOffset, loc, builder));
+            // Reuse stride.
+            strides.push_back(lhsStride);
+          } else {
+            // Assert that offsets are equal if strides are not equal.
+            // This is because we are already forcing the strides to be
+            // equal to 1 earlier for case both offsets and strides not equal.
+            assert(lhsOffset == rhsOffset &&
+                   "If strides are not equal, offsets must be equal");
+            // For case like offset * lhs_stride + offset * rhs_stride, it is
+            // same as offset * (lhs_stride + rhs_stride). We can just add the
+            // strides and reuse the offset like this:
+            //   offsets[i] = lhsOffset
+            //   strides[i] = lhsStride + rhsStride
+
+            // Reuse offsets.
+            offsets.push_back(lhsOffset);
+            // Add strides.
+            strides.push_back(addOFRs(lhsStride, rhsStride, loc, builder));
+          }
+        }
+      } else {
+        // Set stride to 1 when not continuous.
+        strides.push_back(builder.getIndexAttr(1));
+        // New offset is offset * stride.
+        auto newLhsOffset = lhsState.offsets[i];
+        auto newRhsOffset = rhsState.offsets[i];
+        // Just propagate the unstructured offset to the result to track the
+        // unstructured dimension. The real address calculation will be done
+        // later in the PtrAnalysis::visitOperandAddptr.
+        auto newOffset =
+            lhsState.dimIsStructured(i) ? newRhsOffset : newLhsOffset;
+        offsets.push_back(newOffset);
+      }
+    }
 
     sizes.push_back(lhsState.sizes[i]);
   }
 
   // AddPtr where both lhs and rhs containing modulo operators not supported
   if (lhsState.hasModulo() && rhsState.hasModulo()) {
-    op->emitRemark("PtrAnalysis: do not support adding two pointer states "
-                   "that both have modulo");
+    LLVM_DEBUG(
+        op->emitRemark("PtrAnalysis: do not support adding two pointer states "
+                       "that both have modulo"));
     return failure();
   }
 
@@ -225,7 +468,15 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
     std::swap(lhs, rhs);
   }
 
+  auto indexTy = IndexType::get(op->getContext());
+  auto index0 = IntegerAttr::get(indexTy, APInt(64, 0));
   for (uint64_t i = 0; i < lhs->getRank(); i++) {
+    if (!lhs->dimIsStructured(i) || !rhs->dimIsStructured(i)) {
+      // Shape is always 0 for non-structured dimension.
+      shape.push_back(index0);
+      continue;
+    }
+
     if (!lhs->dimHasModulo(i)) {
       shape.push_back(lhs->shape[i]);
     } else if (hasConstZero(rhs->offsets[i])) {
@@ -233,17 +484,17 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
     } else if (i == 0 && lhs->getRank() == 2 && rhs->scalar) {
       shape.push_back(lhs->shape[1]);
       shape.push_back(lhs->shape[0]);
-      op->emitWarning(
+      LLVM_DEBUG(op->emitWarning(
           "PtrAnalysis: allowing adding pointer state with modulo in dim 0 to "
           "another pointer state with offset in dim 0.\nPlease verify the "
           "operand that contains a scalar is meant to increment pointers in "
           "dim1. If that is not the case it WILL LEAD TO WRONG COMPILATION "
           "RESULTS.\n\nTo avoid this warning, use expand_dims (instead of "
-          "splat) to explicitly specify which dimension contains the scalar.");
+          "splat) to explicitly specify which dimension contains the scalar."));
       break;
     } else {
-      op->emitRemark(
-          "PtrAnalysis: do not support adding to operand with modulo");
+      LLVM_DEBUG(op->emitRemark(
+          "PtrAnalysis: do not support adding to operand with modulo"));
       return failure();
     }
   }
@@ -251,8 +502,43 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
   return success();
 }
 
+void PtrState::dump() const {
+  llvm::dbgs() << "PtrState: ";
+  if (source) {
+    llvm::dbgs() << "source: " << source << "\n";
+  }
+  if (scalar) {
+    llvm::dbgs() << "scalar: " << scalar << "\n";
+  }
+
+  llvm::dbgs() << "offsets:\n";
+  llvm::interleave(offsets, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\nstrides:\n";
+  llvm::interleave(strides, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\nsizes:\n";
+  llvm::interleave(sizes, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\nshape:\n";
+  llvm::interleave(shape, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\norder:\n";
+  llvm::interleave(order, llvm::dbgs(), "\n");
+  if (isStructured()) {
+    llvm::dbgs() << "structured\n";
+  } else {
+    for (int i = 0; i < getRank(); i++) {
+      llvm::dbgs() << "dim " << i;
+      if (dimIsStructured(i))
+        llvm::dbgs() << " structured\n";
+      else
+        llvm::dbgs() << " not strucuted\n";
+    }
+  }
+
+  llvm::dbgs() << "\n";
+}
+
 LogicalResult PtrState::mulState(const PtrState &lhsState,
-                                 const PtrState &rhsState, Operation *op,
+                                 const PtrState &rhsState,
+                                 bool isAnalysisingUnstructured, Operation *op,
                                  OpBuilder &builder) {
   assert(isEmpty() && lhsState.getRank() == rhsState.getRank());
 
@@ -261,18 +547,16 @@ LogicalResult PtrState::mulState(const PtrState &lhsState,
   // neither lhs nor rhs should have source, since multiplying base pointer
   // does not make sense
   if (lhsState.source && rhsState.source) {
-    op->emitRemark("PtrAnalysis: do not support multiplying base pointers");
+    LLVM_DEBUG(op->emitRemark(
+        "PtrAnalysis: do not support multiplying base pointers"));
     return failure();
   }
 
-  assert(!(lhsState.scalar && rhsState.scalar) &&
-         "do not expect to see both lhs and rhs are scalars");
-
   // currently do not support both tensors are effectively non-scalar
   if (!lhsState.scalar && !rhsState.scalar) {
-    op->emitRemark(
+    LLVM_DEBUG(op->emitRemark(
         "PtrAnalysis: only support multiplying pointer states when one of "
-        "them represent a scalar");
+        "them represent a scalar"));
     return failure();
   }
 
@@ -283,25 +567,88 @@ LogicalResult PtrState::mulState(const PtrState &lhsState,
     std::swap(lhs, rhs);
   }
 
+  if (lhsState.scalar && rhsState.scalar) {
+    scalar =
+        builder.create<arith::MulIOp>(loc, lhsState.scalar, rhsState.scalar);
+  }
+
+  auto indexTy = IndexType::get(op->getContext());
+  auto index0 = IntegerAttr::get(indexTy, APInt(64, 0));
   for (uint64_t i = 0; i < lhs->sizes.size(); i++) {
-    OpFoldResult newOffset =
-        mulOFRValue(lhs->offsets[i], rhs->scalar, loc, builder);
-    OpFoldResult newStride =
-        mulOFRValue(lhs->strides[i], rhs->scalar, loc, builder);
-    OpFoldResult newShape =
-        mulOFRValue(lhs->shape[i], rhs->scalar, loc, builder);
-    offsets.push_back(newOffset);
-    strides.push_back(newStride);
-    shape.push_back(newShape);
+    if (lhs->dimIsStructured(i)) {
+      OpFoldResult newOffset =
+          mulOFRs(lhs->offsets[i], rhs->scalar, loc, builder);
+      offsets.push_back(newOffset);
+      OpFoldResult newStride =
+          mulOFRs(lhs->strides[i], rhs->scalar, loc, builder);
+      strides.push_back(newStride);
+      OpFoldResult newShape = mulOFRs(lhs->shape[i], rhs->scalar, loc, builder);
+      shape.push_back(newShape);
+    } else {
+      assert(!lhs->dimHasModulo(i) &&
+             "should not have non-structured dimension with modulo");
+      if (isAnalysisingUnstructured) {
+        assert(!lhs->hasModulo() &&
+               "should not have non-structured dimension with modulo");
+        // Keep offsets as is for unstructured dimension.
+        // The address calculation will be done later in structured to
+        // memref pass.
+        offsets.push_back(lhs->offsets[i]);
+        // Mul the scalar to stride.
+        OpFoldResult newStride =
+            mulOFRs(lhs->strides[i], rhs->scalar, loc, builder);
+        strides.push_back(newStride);
+      } else {
+        // Just propagate the unstructured offset to the result to track the
+        // unstructured dimension. The real address calculation will be done
+        // later in the PtrAnalysis::visitOperandAddptr.
+        OpFoldResult newOffset = lhs->offsets[i];
+        offsets.push_back(newOffset);
+        // Mul the scalar to stride.
+        OpFoldResult newStride = lhs->strides[i];
+        strides.push_back(newStride);
+      }
+      // Shape is always 0 for non-structured dimension.
+      shape.push_back(index0);
+    }
     sizes.push_back(lhs->sizes[i]);
   }
 
   if (rhs->hasModulo()) {
-    op->emitRemark(
+    LLVM_DEBUG(op->emitRemark(
         "PtrAnalysis: do not support multiplying pointer states that has "
-        "modulos");
+        "modulos"));
     return failure();
   }
+
+  return success();
+}
+
+LogicalResult PtrState::mergeUnstructuredState(const PtrState &other,
+                                               Operation *op) {
+  if (isStructured() || other.isStructured()) {
+    LLVM_DEBUG(op->emitRemark("Expect merging pointer states both of which are "
+                              "unstructured, but got structured state"));
+    return failure();
+  }
+  if (other.getNonStructuredDim() != getNonStructuredDim()) {
+    LLVM_DEBUG(op->emitRemark(
+        "PtrAnalysis: do not support merging pointer states with "
+        "different non-structured dimensions"));
+    return failure();
+  }
+  if (getRank() != other.getRank()) {
+    LLVM_DEBUG(op->emitRemark(
+        "PtrAnalysis: do not support merging pointer states with "
+        "different ranks"));
+    return failure();
+  }
+  int gatherDim = other.getNonStructuredDim();
+
+  // Merge gatherDim data from other.
+  offsets[gatherDim] = other.offsets[gatherDim];
+  strides[gatherDim] = other.strides[gatherDim];
+  shape[gatherDim] = other.shape[gatherDim];
 
   return success();
 }
@@ -325,6 +672,52 @@ tts::MakeTensorPtrOp PtrState::createTTSMakeTensorPtrOp(OpBuilder &builder,
   return op;
 }
 
+tts::MakeGatherScatterTensorPtrOp
+PtrState::createTTSMakeGatherScatterTensorPtrOp(OpBuilder &builder,
+                                                Location loc) {
+  SmallVector<int64_t> staticSizes;
+  for (size_t i = 0; i < getRank(); i++) {
+    auto s = getIntAttr(sizes[i]);
+    assert(s.has_value());
+    staticSizes.push_back(s.value());
+  }
+
+  int nonContinuousDim = getNonStructuredDim();
+
+  Value nonContinuousOffset = cast<Value>(offsets[nonContinuousDim]);
+
+  // Collapse nonContinuousOffset to 1D.
+  auto offsetTy = cast<ShapedType>(nonContinuousOffset.getType());
+  if (offsetTy.getRank() > 1) {
+    SmallVector<ReassociationExprs, 4> reassociationMap(1);
+    for (int i = 0; i < offsetTy.getRank(); ++i)
+      reassociationMap[0].push_back(builder.getAffineDimExpr(i));
+
+    int offsetSize = 1;
+    for (int size : offsetTy.getShape())
+      offsetSize *= size;
+
+    auto collapseTy =
+        RankedTensorType::get({offsetSize}, offsetTy.getElementType());
+    nonContinuousOffset =
+        builder
+            .create<tensor::CollapseShapeOp>(
+                loc, collapseTy, nonContinuousOffset, reassociationMap)
+            .getResult();
+    offsets[nonContinuousDim] = nonContinuousOffset;
+  }
+  // Generate tts::make_gather_scatter_tensor_ptr.
+  auto op = builder.create<mlir::tts::MakeGatherScatterTensorPtrOp>(
+      loc, source, nonContinuousOffset, nonContinuousDim, staticSizes, strides,
+      offsets);
+  LLVM_DEBUG({
+    llvm::dbgs() << "creating tts::make_gather_scatter_tensor_ptr:\n";
+    op->dump();
+  });
+
+  return op;
+}
+
 LogicalResult PtrAnalysis::visitOperandAdd(arith::AddIOp addOp, PtrState &state,
                                            const Location loc,
                                            OpBuilder &builder) {
@@ -334,18 +727,43 @@ LogicalResult PtrAnalysis::visitOperandAdd(arith::AddIOp addOp, PtrState &state,
   }
 
   PtrState rhsState;
-  if (visitOperand(addOp.getRhs(), rhsState, loc, builder).failed())
+  if (visitOperand(addOp.getRhs(), rhsState, loc, builder).failed()) {
     return failure();
+  }
 
   // Checking for higher dimension is done in addState below
   if ((lhsState.getRank() == 1 && lhsState.hasModulo()) ||
       (rhsState.getRank() == 1 && rhsState.hasModulo())) {
-    addOp->emitRemark(
-        "PtrAnalysis: do not support this pattern: a + arange(0, K) % M");
+    LLVM_DEBUG(addOp->emitRemark(
+        "PtrAnalysis: do not support this pattern: a + arange(0, K) % M"));
     return failure();
   }
 
-  return state.addState(lhsState, rhsState, addOp, builder);
+  // When one state hasModulo while other state is not structured.
+  // Need to clear the modulo and use the operand as offset directly.
+  if (!lhsState.isStructured() && rhsState.hasModulo()) {
+    // TODO: support modulo in this case.
+    if (!enableMakeGatherScatterTensorPtr ||
+        rhsState
+            .rebuildAsGatherScatter(addOp.getRhs(),
+                                    lhsState.getNonStructuredDim())
+            .failed())
+      return failure();
+  } else if (lhsState.hasModulo() && !rhsState.isStructured()) {
+    if (!enableMakeGatherScatterTensorPtr ||
+        lhsState
+            .rebuildAsGatherScatter(addOp.getLhs(),
+                                    rhsState.getNonStructuredDim())
+            .failed())
+      return failure();
+  }
+  if (isAnalysisingUnstructured) {
+    assert(enableMakeGatherScatterTensorPtr &&
+           "isAnalysisingUnstructured should not be true when "
+           "enableMakeGatherScatterTensorPtr is false");
+  }
+  return state.addState(lhsState, rhsState, isAnalysisingUnstructured, addOp,
+                        builder);
 }
 
 LogicalResult PtrAnalysis::visitOperandMul(arith::MulIOp mulOp, PtrState &state,
@@ -361,13 +779,45 @@ LogicalResult PtrAnalysis::visitOperandMul(arith::MulIOp mulOp, PtrState &state,
     return failure();
   }
 
-  return state.mulState(lhsState, rhsState, mulOp, builder);
+  // When one state hasModulo while other state is not structured.
+  // Need to clear the modulo and use the operand as offset directly.
+  if (!lhsState.isStructured() && rhsState.hasModulo()) {
+    // TODO: support modulo in this case.
+    if (!enableMakeGatherScatterTensorPtr ||
+        rhsState
+            .rebuildAsGatherScatter(mulOp.getRhs(),
+                                    lhsState.getNonStructuredDim())
+            .failed())
+      return failure();
+  } else if (lhsState.hasModulo() && !rhsState.isStructured()) {
+    if (!enableMakeGatherScatterTensorPtr ||
+        lhsState
+            .rebuildAsGatherScatter(mulOp.getLhs(),
+                                    rhsState.getNonStructuredDim())
+            .failed())
+      return failure();
+  }
+
+  if (isAnalysisingUnstructured) {
+    assert(enableMakeGatherScatterTensorPtr &&
+           "isAnalysisingUnstructured should not be true when "
+           "enableMakeGatherScatterTensorPtr is false");
+  }
+  return state.mulState(lhsState, rhsState, isAnalysisingUnstructured, mulOp,
+                        builder);
 }
 
 LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
                                            PtrState &state, const Location loc,
                                            OpBuilder &builder) {
   assert(state.isEmpty());
+  if (isAnalysisingUnstructured) {
+    assert(enableMakeGatherScatterTensorPtr &&
+           "PtrAnalysis: isAnalysisingUnstructured should only be true "
+           "when enableMakeGatherScatterTensorPtr is true");
+    // If we are analyzing unstructured state, just build state from current op.
+    return state.rebuildAsUnsupportedOp(remOp.getResult());
+  }
 
   PtrState rhsState;
   if (visitOperand(remOp.getRhs(), rhsState, loc, builder).failed()) {
@@ -375,8 +825,9 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
   }
 
   if (!rhsState.scalar) {
-    remOp->emitRemark("PtrAnalysis: only support cases when rhs of remainder "
-                      "contains scalar");
+    LLVM_DEBUG(remOp->emitRemark(
+        "PtrAnalysis: only support cases when rhs of remainder "
+        "contains scalar"));
     return failure();
   }
 
@@ -384,13 +835,27 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
     return failure();
   }
 
+  // When lhs already not structured, just build state from current op.
+  if (!state.isStructured()) {
+    return state.rebuildAsGatherScatter(remOp.getResult(),
+                                        state.getNonStructuredDim());
+  }
+
   // If there are multiple modulo ops on an expression (e.g.: (a % b) % c), we
   // would have already populated the modulo states after visiting the lhs.
   // Assert that all the modulo states are empty.
   if (state.hasModulo()) {
-    remOp->emitRemark(
-        "PtrAnalysis: do not support multiple modulo within an expression");
-    return failure();
+    LLVM_DEBUG(remOp->emitRemark(
+        "PtrAnalysis: do not support multiple modulo within an expression"));
+    // Multiple modulo ops on an expression is not supported.
+    // But when the state has only one dimension, we can make it as
+    // gather/scatter tensor ptr.
+    if (state.getRank() == 1 && enableMakeGatherScatterTensorPtr)
+      // Build the state from the current operation as an unstructured state,
+      // but only when there is a single dimension involved.
+      return state.rebuildAsGatherScatter(remOp.getResult(), 0);
+    else
+      return failure();
   }
 
   if (state.getRank() == 1) {
@@ -413,13 +878,13 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
     } else if (shape[1] == 1) {
       state.shape[0] = rhsState.scalar;
     } else {
-      remOp->emitRemark(
+      LLVM_DEBUG(remOp->emitRemark(
           "PtrAnalysis: taking modulo on a 2D tensor with no singleton "
-          "dimension not supported");
+          "dimension not supported"));
       return failure();
     }
   } else {
-    remOp->emitRemark("PtrAnalysis: unsupported modulo pattern");
+    LLVM_DEBUG(remOp->emitRemark("PtrAnalysis: unsupported modulo pattern"));
     return failure();
   }
   return success();
@@ -477,9 +942,9 @@ PtrAnalysis::visitOperandExpandDims(triton::ExpandDimsOp expandDimsOp,
   state.shape.insert(state.shape.begin() + axis, builder.getIndexAttr(0));
 
   if (state.hasModulo() && state.getRank() > 2) {
-    expandDimsOp->emitRemark(
+    LLVM_DEBUG(expandDimsOp->emitRemark(
         "PtrAnalysis: unsupported scenario where expand_dims result "
-        "has modulo and rank > 2");
+        "has modulo and rank > 2"));
     return failure();
   }
 
@@ -496,7 +961,8 @@ PtrAnalysis::visitOperandBroadcast(triton::BroadcastOp broadcastOp,
   auto dst = broadcastOp.getResult();
 
   if (!isa<ShapedType>(src.getType())) {
-    broadcastOp->emitRemark("PtrAnalysis: Unsupported broadcast source type");
+    LLVM_DEBUG(broadcastOp->emitRemark(
+        "PtrAnalysis: Unsupported broadcast source type"));
     return failure();
   }
 
@@ -544,7 +1010,7 @@ LogicalResult PtrAnalysis::visitOperandSplat(triton::SplatOp splatOp,
       state.shape.push_back(builder.getIndexAttr(0));
     }
   } else {
-    splatOp->emitRemark("PtrAnalysis: unsupported splat pattern");
+    LLVM_DEBUG(splatOp->emitRemark("PtrAnalysis: unsupported splat pattern"));
     return failure();
   }
 
@@ -554,8 +1020,9 @@ LogicalResult PtrAnalysis::visitOperandSplat(triton::SplatOp splatOp,
     state.offsets[0] = state.scalar;
 
   if (state.hasModulo() && state.getRank() > 2) {
-    splatOp->emitRemark("PtrAnalysis: unsupported scenario where splat result "
-                        "has modulo and rank > 2");
+    LLVM_DEBUG(splatOp->emitRemark(
+        "PtrAnalysis: unsupported scenario where splat result "
+        "has modulo and rank > 2"));
     return failure();
   }
 
@@ -571,8 +1038,10 @@ LogicalResult PtrAnalysis::visitOperandAddptr(triton::AddPtrOp addptrOp,
   PtrState ptrState;
   if (visitOperand(addptrOp.getPtr(), ptrState, addptrOp.getLoc(), builder)
           .failed()) {
-    // assert(0);
     return failure();
+  } else if (!ptrState.source) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "No src ptr state when processing " << addptrOp << "\n");
   }
 
   PtrState offsetState;
@@ -587,7 +1056,13 @@ LogicalResult PtrAnalysis::visitOperandAddptr(triton::AddPtrOp addptrOp,
   assert(ptrState.getRank() == offsetState.getRank() &&
          "ptr and offset field should have the same rank");
 
-  return state.addState(ptrState, offsetState, addptrOp, builder);
+  if (isAnalysisingUnstructured) {
+    assert(enableMakeGatherScatterTensorPtr &&
+           "isAnalysisingUnstructured should not be true when "
+           "enableMakeGatherScatterTensorPtr is false");
+  }
+  return state.addState(ptrState, offsetState, isAnalysisingUnstructured,
+                        addptrOp, builder);
 }
 
 LogicalResult PtrAnalysis::visitOperandConstSplat(arith::ConstantOp op,
@@ -648,8 +1123,8 @@ PtrAnalysis::visitOperandMakeTensorPtr(triton::MakeTensorPtrOp makeTPtrOp,
   state.source = makeTPtrOp.getBase();
 
   if (makeTPtrOp.getOrder().empty()) {
-    makeTPtrOp->emitRemark(
-        "PtrAnalysis: expect tt.make_tensor_ptr to have order field set");
+    LLVM_DEBUG(makeTPtrOp->emitRemark(
+        "PtrAnalysis: expect tt.make_tensor_ptr to have order field set"));
     return failure();
   }
 
@@ -692,9 +1167,9 @@ LogicalResult PtrAnalysis::visitOperandForOp(scf::ForOp forOp, Value operand,
 
   auto newState = getLoopResultPtrState(forOp, index);
   if (failed(newState)) {
-    forOp.emitError(
+    LLVM_DEBUG(forOp.emitWarning(
         "Rewrite for-op failed. Could not find PtrState returned by "
-        "the loop.");
+        "the loop."));
     return failure();
   }
 
@@ -702,11 +1177,39 @@ LogicalResult PtrAnalysis::visitOperandForOp(scf::ForOp forOp, Value operand,
   return success();
 }
 
+LogicalResult PtrAnalysis::visitOperandIntToPtr(triton::IntToPtrOp op,
+                                                PtrState &state,
+                                                const Location loc,
+                                                OpBuilder &builder) {
+  state.source = op.getResult();
+  return success();
+}
+
+LogicalResult PtrAnalysis::visitOperandBitcast(triton::BitcastOp op,
+                                               PtrState &state,
+                                               const Location loc,
+                                               OpBuilder &builder) {
+  auto resType = op.getResult().getType();
+  if (isa<ShapedType>(resType)) {
+    return visitOperand(op.getSrc(), state, loc, builder);
+  }
+  state.source = op.getResult();
+  return success();
+}
+
 LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
                                         const Location loc,
                                         OpBuilder &builder) {
-
-  if (knownPtrs.find(operand) != knownPtrs.end()) {
+  if (isAnalysisingUnstructured) {
+    assert(enableMakeGatherScatterTensorPtr &&
+           "isAnalysisingUnstructured should not be true when "
+           "enableMakeGatherScatterTensorPtr is false");
+  }
+  // Not using knownPtrs when isAnalysisingUnstructured is true.
+  // This is because we are analyzing unstructured state, the data in knownPtrs
+  // is not valid for unstructured state.
+  if (!isAnalysisingUnstructured &&
+      knownPtrs.find(operand) != knownPtrs.end()) {
     state = knownPtrs.lookup(operand);
     return success();
   }
@@ -732,10 +1235,19 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
       if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(op)) {
         return visitOperandAddptr(cast<triton::AddPtrOp>(op), state, loc,
                                   builder);
+      } else if (auto castOp = dyn_cast<triton::BitcastOp>(op)) {
+        return visitOperandBitcast(castOp, state, loc, builder);
+      } else if (auto intToPtrOp = dyn_cast<triton::IntToPtrOp>(op)) {
+        return visitOperandIntToPtr(intToPtrOp, state, loc, builder);
       } else if (auto makeTensorOp = dyn_cast<triton::MakeTensorPtrOp>(op)) {
         llvm_unreachable("Unexpected operand defining operation tts.make_tptr");
+      } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        state.source = operand;
+        return success();
       } else {
-        llvm_unreachable("Unexpected operand defining operation");
+        LLVM_DEBUG(op->emitRemark(
+            "Unexpected defining op for triton pointer operand"));
+        return failure();
       }
     } else {
       state.source = operand;
@@ -776,10 +1288,17 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
     state = knownPtrs[operand];
     return success();
   } else {
-    llvm::dbgs() << "PtrAnalysis: encountered addptr operand produced by an "
-                    "unsupported operation\n";
-    operand.dump();
-    return failure();
+    LLVM_DEBUG(llvm::dbgs()
+               << "PtrAnalysis: encountered addptr operand produced by an "
+                  "unsupported operation: "
+               << operand);
+
+    if (!enableMakeGatherScatterTensorPtr) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "PtrAnalysis: failed to rebuild as unsupported op\n");
+      return failure();
+    }
+    return state.rebuildAsUnsupportedOp(operand);
   }
 }
 
@@ -794,8 +1313,41 @@ LogicalResult PtrAnalysis::rewriteAddptrOp(triton::AddPtrOp op) {
   knownPtrs[op.getResult()] = state;
 
   if (isa<RankedTensorType>(op.getPtr().getType())) {
-    auto maketptrOp = state.createTTSMakeTensorPtrOp(builder, op.getLoc());
-    ptrMap.map(op.getResult(), maketptrOp.getResult());
+    if (state.isStructured()) {
+      auto maketptrOp = state.createTTSMakeTensorPtrOp(builder, op.getLoc());
+      ptrMap.map(op.getResult(), maketptrOp.getResult());
+    } else if (enableMakeGatherScatterTensorPtr) {
+      PtrState unstructuredState;
+      // Switch to unstructured state analysis to create offsets and strides
+      // for the non-structured dimension.
+      // NOTE: this is the only place where we switch to unstructured state
+      // analysis.
+      isAnalysisingUnstructured = true;
+      // Visit the operand again to calculate the offsets and strides for the
+      // unstructured state.
+      LogicalResult result =
+          visitOperandAddptr(op, unstructuredState, op.getLoc(), builder);
+      // Switch back to structured state analysis.
+      isAnalysisingUnstructured = false;
+      if (result.failed()) {
+        LLVM_DEBUG(op->emitRemark(
+            "PtrAnalysis: Failed to analyze ptr of tt.addptr for "
+            "unstructured state"));
+        return failure();
+      }
+      if (state.mergeUnstructuredState(unstructuredState, op).failed()) {
+        LLVM_DEBUG(op->emitRemark(
+            "PtrAnalysis: Failed to merge unstructured state for tt.addptr"));
+        return failure();
+      }
+      auto maketptrOp =
+          state.createTTSMakeGatherScatterTensorPtrOp(builder, op.getLoc());
+      // Update knownPtrs to merged state.
+      knownPtrs[op.getResult()] = state;
+      ptrMap.map(op.getResult(), maketptrOp.getResult());
+    } else {
+      return failure();
+    }
   } else {
     // record the ptr as we have visited and built up the state for this scalar
     // pointer, which may be used by rewriteForOp later.
@@ -824,7 +1376,8 @@ LogicalResult PtrAnalysis::rewriteAdvanceOp(triton::AdvanceOp op) {
 
   PtrState state;
   if (visitOperand(op->getOperand(0), state, loc, builder).failed()) {
-    op->emitRemark("PtrAnalysis: Failed to analyze ptr of tt.advance");
+    LLVM_DEBUG(
+        op->emitRemark("PtrAnalysis: Failed to analyze ptr of tt.advance"));
     return failure();
   }
   assert(state.isBlockPtr() &&
@@ -841,12 +1394,12 @@ LogicalResult PtrAnalysis::rewriteAdvanceOp(triton::AdvanceOp op) {
           loc, builder.getIndexAttr(offsetIntAttr.value()));
       offsetValue = constOp.getResult();
     } else {
-      offsetValue = offset.get<Value>();
+      offsetValue = cast<Value>(offset);
     }
     auto castOp = builder.create<arith::IndexCastOp>(
         loc, builder.getIndexType(), increment);
     auto mulOp = builder.create<arith::MulIOp>(loc, castOp.getResult(),
-                                               stride.get<Value>());
+                                               cast<Value>(stride));
     auto addOp =
         builder.create<arith::AddIOp>(loc, mulOp.getResult(), offsetValue);
     newOffsets.push_back(addOp.getResult());
@@ -954,6 +1507,11 @@ FailureOr<PtrState> PtrAnalysis::getLoopIterArgPtrState(scf::ForOp forOp,
     return failure();
   }
 
+  if (!state->isStructured()) {
+    // Skip if the loop init arg is not structured.
+    return failure();
+  }
+
   return reconcileLoopPtrState(
       forOp, index, state.value(),
       [](scf::ForOp op, size_t index) { return op.getRegionIterArg(index); });
@@ -966,6 +1524,10 @@ FailureOr<PtrState> PtrAnalysis::getLoopResultPtrState(scf::ForOp forOp,
     return failure();
   }
 
+  if (!state->isStructured()) {
+    // Skip if the loop init arg is not structured.
+    return failure();
+  }
   return reconcileLoopPtrState(
       forOp, index, state.value(),
       [](scf::ForOp op, size_t index) { return op->getResult(index); });
@@ -983,11 +1545,14 @@ LogicalResult PtrAnalysis::rewriteForOp(scf::ForOp op) {
       // considered structured by PtrAnalysis, failing to retrieve the PtrState
       // should not fail the rewrite process.
       // We emit an error for diagnostics and debugging purposes.
-      op->emitWarning(
+      LLVM_DEBUG(op->emitWarning(
           "Rewrite for-op failed. Could not find PtrState for iter-arg index " +
-          std::to_string(i));
+          std::to_string(i)));
       continue;
     }
+    // Skip when no structured dimension exists
+    if (state->noStructuredDimExists())
+      continue;
 
     // Save the current init arg's PtrState
     knownPtrs[arg] = state.value();
@@ -1028,8 +1593,8 @@ LogicalResult PtrAnalysis::rewriteForOp(scf::ForOp op) {
 
   // Recursively rewrite the inner ops
   if (rewriteOp(op).failed()) {
-    op->emitRemark(
-        "PtrAnalysis: update loop body failed when rewriting for op");
+    LLVM_DEBUG(op->emitRemark(
+        "PtrAnalysis: update loop body failed when rewriting for op"));
     return failure();
   }
 
@@ -1044,13 +1609,19 @@ PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
   // analyze this pointer. In such cases, simply remap all uses of the
   // structured value back to its original triton value.
   if (!knownPtrs.contains(tritonValue)) {
-    op.emitRemark(
-        "Rewrite GetStructuredStateOp failed. Could not find PtrState.");
+    LLVM_DEBUG(op.emitRemark(
+        "Rewrite GetStructuredStateOp failed. Could not find PtrState."));
     op.getResult(0).replaceAllUsesWith(tritonValue);
     return failure();
   }
 
   tts::PtrState state = knownPtrs[tritonValue];
+  if (!state.isStructured()) {
+    LLVM_DEBUG(op.emitRemark(
+        "Rewrite GetStructuredStateOp failed. PtrState is not structured."));
+    op.getResult(0).replaceAllUsesWith(tritonValue);
+    return failure();
+  }
   Value remappedValue =
       ptrMap.contains(tritonValue) ? ptrMap.lookup(tritonValue) : tritonValue;
 
@@ -1077,7 +1648,7 @@ PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
             op.getLoc(), builder.getIndexAttr(sIntAttr.value()));
         replacements.push_back(constOp.getResult());
       } else {
-        replacements.push_back(s.get<Value>());
+        replacements.push_back(cast<Value>(s));
       }
     }
 
@@ -1088,7 +1659,7 @@ PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
             op.getLoc(), builder.getIndexAttr(sIntAttr.value()));
         replacements.push_back(constOp.getResult());
       } else {
-        replacements.push_back(s.get<Value>());
+        replacements.push_back(cast<Value>(s));
       }
     }
   }
@@ -1106,14 +1677,16 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
   auto loc = op.getLoc();
 
   if (!ptr) {
-    op->emitRemark("PtrAnalysis: pointer is not replace with tts.make_tptr so "
-                   "loadOp cannot be rewritten");
+    LLVM_DEBUG(op->emitRemark(
+        "PtrAnalysis: pointer is not replace with tts.make_tptr so "
+        "loadOp cannot be rewritten"));
     return failure();
   }
 
   auto ptrType = dyn_cast<triton::PointerType>(ptr.getType());
   if (ptrType && !isa<ShapedType>(ptrType.getPointeeType())) {
-    op->emitRemark("PtrAnalysis: scalar loadOp will not be rewritten");
+    LLVM_DEBUG(
+        op->emitRemark("PtrAnalysis: scalar loadOp will not be rewritten"));
     return failure();
   }
 
@@ -1126,7 +1699,11 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
   // are moving.
   if (mask) {
     if (mstate.parse(mask, loc, builder).failed()) {
-      op->emitRemark("MaskAnalysis failed");
+      LLVM_DEBUG(op->emitRemark("MaskAnalysis failed"));
+      return failure();
+    }
+    ptr = applyUnstructuredMask(op, ptr, mstate, loc, builder);
+    if (!ptr) {
       return failure();
     }
     dims = mstate.dims;
@@ -1135,10 +1712,10 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
   if (other) {
     assert(mask && "other value used while no masks are specified");
 
-    scalarOther = getScalarValue(other, loc, builder);
+    scalarOther = utils::getScalarValue(other, loc, builder);
     if (!scalarOther) {
-      op->emitRemark("other value used in masked load produced by "
-                     "unsupported instruction");
+      LLVM_DEBUG(op->emitRemark("other value used in masked load produced by "
+                                "unsupported instruction"));
       return failure();
     }
   }
@@ -1200,25 +1777,23 @@ void PtrAnalysis::initializeMaybeStructuredArgs(Operation *op) {
       // op, its corresponding iter-arg and loop result will also be considered
       // "maybeStructured".
       if (auto forOp = dyn_cast<scf::ForOp>(user)) {
-        auto it = llvm::find(forOp.getInitArgs(), v);
-
-        if (it == forOp.getInitArgs().end()) {
-          continue;
-        }
-
-        auto argIndex = std::distance(forOp.getInitArgs().begin(), it);
-        auto iterArg = forOp.getRegionIterArg(argIndex);
-        auto tiedLoopRes = forOp.getTiedLoopResult(iterArg);
-
-        SmallVector<Value> neighbors{iterArg, tiedLoopRes};
-        for (auto neighbor : neighbors) {
-          maybeStructuredArgs.insert(neighbor);
-          if (!visited.contains(neighbor)) {
-            visited.insert(neighbor);
-            q.push(neighbor);
+        for (auto [argIndex, arg] :
+             llvm::zip(llvm::index_range(0, forOp.getInitArgs().size()),
+                       forOp.getInitArgs())) {
+          if (arg != v) {
+            continue;
+          }
+          auto iterArg = forOp.getRegionIterArg(argIndex);
+          auto tiedLoopRes = forOp.getTiedLoopResult(iterArg);
+          SmallVector<Value> neighbors{iterArg, tiedLoopRes};
+          for (auto neighbor : neighbors) {
+            maybeStructuredArgs.insert(neighbor);
+            if (!visited.contains(neighbor)) {
+              visited.insert(neighbor);
+              q.push(neighbor);
+            }
           }
         }
-
       } else {
         for (auto res : user->getResults()) {
           if (res.getType() != v.getType()) {
@@ -1243,14 +1818,16 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
   auto loc = op.getLoc();
 
   if (!ptr) {
-    op->emitRemark("PtrAnalysis: pointer is not replace with tts.make_tptr so "
-                   "storeOp cannot be rewritten");
+    LLVM_DEBUG(op->emitRemark(
+        "PtrAnalysis: pointer is not replace with tts.make_tptr so "
+        "storeOp cannot be rewritten"));
     return failure();
   }
 
   auto ptrType = dyn_cast<triton::PointerType>(ptr.getType());
   if (ptrType && !isa<ShapedType>(ptrType.getPointeeType())) {
-    op->emitRemark("PtrAnalysis: scalar storeOp will not be rewritten");
+    LLVM_DEBUG(
+        op->emitRemark("PtrAnalysis: scalar storeOp will not be rewritten"));
     return failure();
   }
 
@@ -1263,7 +1840,11 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
   // are moving.
   if (mask) {
     if (mstate.parse(mask, loc, builder).failed()) {
-      op->emitRemark("MaskAnalysis failed");
+      LLVM_DEBUG(op->emitRemark("MaskAnalysis failed"));
+      return failure();
+    }
+    ptr = applyUnstructuredMask(op, ptr, mstate, loc, builder);
+    if (!ptr) {
       return failure();
     }
     dims = mstate.dims;
@@ -1293,33 +1874,37 @@ LogicalResult PtrAnalysis::rewriteOp(Operation *rootOp, bool useUnsafeMask) {
     return TypeSwitch<Operation *, WalkResult>(op)
         .Case<triton::AddPtrOp>([&](auto addptr) {
           if (rewriteAddptrOp(addptr).failed()) {
-            addptr->emitRemark("PtrAnalysis: Failed to rewrite AddPtrOp");
+            LLVM_DEBUG(
+                addptr->emitRemark("PtrAnalysis: Failed to rewrite AddPtrOp"));
           }
           return WalkResult::advance();
         })
         .Case<triton::MakeTensorPtrOp>([&](auto maketptr) {
           if (rewriteMakeTensorPtrOp(maketptr).failed()) {
-            maketptr->emitRemark(
-                "PtrAnalysis: Failed to rewrite MakeTensorPtrOp");
+            LLVM_DEBUG(maketptr->emitRemark(
+                "PtrAnalysis: Failed to rewrite MakeTensorPtrOp"));
           }
           return WalkResult::advance();
         })
         .Case<triton::AdvanceOp>([&](auto advance) {
           if (rewriteAdvanceOp(advance).failed()) {
-            advance->emitRemark("PtrAnalysis: Failed to rewrite AdvanceOp");
+            LLVM_DEBUG(advance->emitRemark(
+                "PtrAnalysis: Failed to rewrite AdvanceOp"));
           }
           return WalkResult::advance();
         })
         .Case<triton::LoadOp>([&](auto load) {
           if (rewriteLoadOp(load, useUnsafeMask).failed()) {
-            load->emitRemark("PtrAnalysis: Failed to rewrite LoadOp");
+            LLVM_DEBUG(
+                load->emitRemark("PtrAnalysis: Failed to rewrite LoadOp"));
             return WalkResult::advance();
           }
           return WalkResult::skip();
         })
         .Case<triton::StoreOp>([&](auto store) {
           if (rewriteStoreOp(store, useUnsafeMask).failed()) {
-            store->emitRemark("PtrAnalysis: Failed to rewrite StoreOp");
+            LLVM_DEBUG(
+                store->emitRemark("PtrAnalysis: Failed to rewrite StoreOp"));
             return WalkResult::advance();
           }
           return WalkResult::skip();
@@ -1330,7 +1915,8 @@ LogicalResult PtrAnalysis::rewriteOp(Operation *rootOp, bool useUnsafeMask) {
           // that the the walk does not visit the for-op's child operations
           // the second time.
           if (rewriteForOp(forOp).failed()) {
-            forOp->emitRemark("PtrAnalysis: Failed to rewrite ForOp");
+            LLVM_DEBUG(
+                forOp->emitRemark("PtrAnalysis: Failed to rewrite ForOp"));
           }
           return WalkResult::skip();
         })
@@ -1351,11 +1937,13 @@ LogicalResult PtrAnalysis::rewriteOp(Operation *rootOp, bool useUnsafeMask) {
                 PtrState state;
                 OpBuilder b(getStateOp);
                 if (succeeded(visitOperand(tritonValue, state,
-                                           getStateOp->getLoc(), b))) {
+                                           getStateOp->getLoc(), b)) &&
+                    state.isStructured()) {
                   knownPtrs[tritonValue] = state;
                 } else {
-                  getStateOp->emitRemark("PtrAnalysis: Failed to populate ptr "
-                                         "state for tensor of indices");
+                  LLVM_DEBUG(getStateOp->emitRemark(
+                      "PtrAnalysis: Failed to populate ptr "
+                      "state for tensor of indices"));
                 }
               }
 

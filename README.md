@@ -25,15 +25,16 @@ You need to set the `TRITON_PLUGIN_DIRS` environment variable to the location of
 ```
 export TRITON_PLUGIN_DIRS=$(pwd)/triton_shared
 
-git clone --recurse-submodules https://github.com/microsoft/triton-shared.git triton_shared
-cd triton_shared/triton/python
+git clone https://github.com/microsoft/triton-shared.git triton_shared
+git clone https://github.com/triton-lang/triton.git
+cd triton && git checkout $(cat ../triton_shared/triton-hash.txt)
 ```
 
 To build with Clang:
 
 ```sh
 python3 -m pip install --upgrade pip
-python3 -m pip install cmake==3.24 ninja pytest-xdist
+python3 -m pip install cmake==3.24 ninja pytest-xdist pybind11 setuptools
 sudo apt-get update -y
 sudo apt-get install -y ccache clang lld
 TRITON_BUILD_WITH_CLANG_LLD=true TRITON_BUILD_WITH_CCACHE=true python3 -m pip install --no-build-isolation -vvv '.[tests]'
@@ -45,11 +46,11 @@ To build with a virtualenv:
 python3 -m venv .venv --prompt triton
 source .venv/bin/activate
 
-pip3 install ninja cmake wheel pytest
-pip3 install -e python --no-build-isolation
+pip3 install ninja cmake wheel pytest pybind11 setuptools
+pip3 install -e . --no-build-isolation
 ```
 
-The resulting `triton-shared` binaries will be placed under `triton/python/build/{current_cmake_version}/third_party/triton_shared`
+The resulting `triton-shared` binaries will be placed under `triton/build/{current_cmake_version}/third_party/triton_shared`
 
 ### 1. Stand-Alone
 The middle layer can be used as a stand-alone component to convert Triton dialect to the middle layer dialects. This is intended for testing and validation purposes, but could potentially be used before sending the IR to another MLIR complier.
@@ -170,11 +171,44 @@ The prototype was tested on the following triton kernel examples:
 The Python tests are setup to run with Pytest and you will need to set the following environment variables to run them:
 ```
 export LLVM_BINARY_DIR=<path-to-your-llvm-binaries>
-export TRITON_SHARED_OPT_PATH=$TRITON_PLUGIN_DIRS/triton/python/build/<your-cmake-directory>/third_party/triton_shared/tools/triton-shared-opt/triton-shared-opt
+export TRITON_SHARED_OPT_PATH=$TRITON_PLUGIN_DIRS/triton/build/<your-cmake-directory>/third_party/triton_shared/tools/triton-shared-opt/triton-shared-opt
 
 pytest <path-to-triton-shared>/python/examples
 ```
 In addition to testing on the tutorial kernels, there are many lit tests covering various scenarios.
+
+## Intermediate Representation (IR) Dumps
+
+To facilitate debugging and analysis, the triton-shared project now supports emitting all intermediate representations (IRs) generated during the compilation process. This functionality is controlled via the environment variable `TRITON_SHARED_DUMP_PATH`.
+
+### How It Works
+
+By setting the `TRITON_SHARED_DUMP_PATH` environment variable, you specify a directory where all intermediate representations will be saved. The Triton compiler will emit IR dumps at various stages of compilation into the specified folder, allowing developers to inspect and analyze the transformations applied to the code.
+
+### How to Use
+
+Create a directory where the IR dumps will be stored (e.g., /path/to/dump_dir).
+Set the `TRITON_SHARED_DUMP_PATH` environment variable to the directory path:
+`export TRITON_SHARED_DUMP_PATH=/path/to/dump_dir`
+Run your Triton compilation as usual. The compiler will emit IR dumps into the specified directory.
+
+### Example
+
+Suppose your dump directory is `/tmp/ir_dumps`. Before running your code, set the environment variable:
+
+```sh
+export TRITON_SHARED_DUMP_PATH=/tmp/ir_dumps
+```
+
+After the compilation process completes, you can explore the `/tmp/ir_dumps` directory to find all the intermediate representation files.
+
+```sh
+$ ls /tmp/ir_dumps
+ll.ir  ll.mlir  tt.mlir  ttshared.mlir
+```
+
+## Debugging Triton Programs
+Triton-shared includes a build option that enables LLVM-sanitizers - AddressSanitizer (ASan) and ThreadSanitizer (TSan) - to help detect memory safety and concurrency issues in Triton programs. These sanitizers dynamically analyze the program during execution, identifying bugs such as buffer overflows and data races respectively. For more details and setup instructions, refer [here](triton-san/README.md).
 
 ## Contributing
 

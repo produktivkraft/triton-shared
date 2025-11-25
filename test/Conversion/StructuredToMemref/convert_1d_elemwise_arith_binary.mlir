@@ -1,9 +1,9 @@
-// RUN: triton-shared-opt --split-input-file --triton-to-linalg-experimental %s | FileCheck %s
+// RUN: triton-shared-opt --triton-to-linalg-experimental %s | FileCheck %s
 module {
   tt.func @kernel(
     %a : !tt.ptr<f32>,
     %b : !tt.ptr<f32>,
-    %c : tensor<1024x!tt.ptr<f32>>
+    %c : !tt.ptr<f32>
   ) -> () {
         %cst = arith.constant dense<true> : tensor<1024xi1>
         // offset calculations
@@ -22,14 +22,19 @@ module {
         %4 = arith.divf %3, %bm : tensor<1024xf32>
         %5 = arith.cmpf "oeq", %4, %bm : tensor<1024xf32>
         %6 = arith.select %5, %am, %bm : tensor<1024xi1>, tensor<1024xf32>
-        tt.store %c, %6 : tensor<1024x!tt.ptr<f32>>
+        // c pointer, intentionally splat the base pointer for brevity
+        %c_out = tt.splat %c : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
+        tt.store %c_out, %6 : tensor<1024x!tt.ptr<f32>>
         tt.return
     }
 }
 
 // CHECK-DAG:   [[MAP_0_:#.+]] = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:  func.func @kernel
-// CHECK-SAME:   ([[PARAM_0_:%.+]]: memref<*xf32>, [[PARAM_1_:%.+]]: memref<*xf32>, [[PARAM_2_:%.+]]: tensor<1024x!tt.ptr<f32>>, [[PARAM_3_:%.+]]: i32, [[PARAM_4_:%.+]]: i32, [[PARAM_5_:%.+]]: i32, [[PARAM_6_:%.+]]: i32, [[PARAM_7_:%.+]]: i32, [[PARAM_8_:%.+]]: i32) {
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: memref<*xf32>, [[PARAM_1_:%.+]]: memref<*xf32>, [[PARAM_2_:%.+]]: memref<*xf32>, [[PARAM_3_:%.+]]: i32, [[PARAM_4_:%.+]]: i32, [[PARAM_5_:%.+]]: i32, [[PARAM_6_:%.+]]: i32, [[PARAM_7_:%.+]]: i32, [[PARAM_8_:%.+]]: i32) {
+// CHECK-DAG:       [[CST_0_:%.+]] = arith.constant 0 : i32
+// CHECK-DAG:       [[VAR_empty_offsets_:%.+]] = tensor.empty() : tensor<1024xi32>
+// CHECK-DAG:       [[VAR_zero_offsets_:%.+]] = linalg.fill ins([[CST_0_]] : i32) outs([[VAR_empty_offsets_]] : tensor<1024xi32>) -> tensor<1024xi32>
 // CHECK-DAG:       [[VAR_reinterpret_cast_:%.+]] = memref.reinterpret_cast [[PARAM_0_]] to offset: [0], sizes: [1024], strides: [1] : memref<*xf32> to memref<1024xf32, strided<[1]>>
 // CHECK-DAG:       [[VAR_reinterpret_cast_0_:%.+]] = memref.reinterpret_cast [[PARAM_1_]] to offset: [0], sizes: [1024], strides: [1] : memref<*xf32> to memref<1024xf32, strided<[1]>>
 // CHECK-DAG:       [[RES_:%.+]] = memref.alloc() : memref<1024xf32>
@@ -69,6 +74,12 @@ module {
 // CHECK:             [[VAR_9_5_:%.+]] = arith.select [[IN_15_]], [[IN_16_]], [[IN_17_]] : f32
 // CHECK:             linalg.yield [[VAR_9_5_]] : f32
 // CHECK:           } -> tensor<1024xf32>
-// CHECK:           tt.store [[PARAM_2_]], [[VAR_8_]] : tensor<1024x!tt.ptr<f32>>
+// CHECK:           [[VAR_cast_:%.+]] = memref.cast [[PARAM_2_]] : memref<*xf32> to memref<?xf32>
+// CHECK:           linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins([[VAR_zero_offsets_]], [[VAR_8_]] : tensor<1024xi32>, tensor<1024xf32>) {
+// CHECK:           ^bb0([[IN_18_:%.+]]: i32, [[IN_19_:%.+]]: f32):
+// CHECK:             [[VAR_10_:%.+]] = arith.index_cast [[IN_18_]] : i32 to index
+// CHECK:             memref.store [[IN_19_]], [[VAR_cast_]]{{.}}[[VAR_10_]]{{.}} : memref<?xf32>
+// CHECK:             linalg.yield
+// CHECK:           }
 // CHECK:           return
 // CHECK:         }
