@@ -1,11 +1,6 @@
-.vscode
-build
-CMakeUserPresets.json
-
 *.pyc
 .cache
 compile_commands.json
-
 build/*
 .vscode/*
 /python/examples/test_core.py
