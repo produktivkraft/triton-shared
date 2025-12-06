@@ -12,6 +12,15 @@ from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 
+
+def get_triton_cache_path():
+    user_home = os.getenv("TRITON_HOME")
+    if not user_home:
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+    if not user_home:
+        raise RuntimeError("Could not find user home directory")
+    return os.path.join(user_home, ".triton")
+
 def _get_llvm_bin_path(bin_name: str) -> str:
     path = os.getenv("LLVM_BINARY_DIR", "")
     if path == "":
@@ -26,7 +35,7 @@ def _get_sanitizer_type():
     if sanitizer_type != "" and sanitizer_type != "asan" and sanitizer_type != "tsan":
         # throw error
         raise Exception(f"TRITON_SHARED_SANITIZER_TYPE {sanitizer_type} is invalid.")
-    
+
     return sanitizer_type
 
 def _sanitizer_available(sanitizer_type):
@@ -34,7 +43,7 @@ def _sanitizer_available(sanitizer_type):
         return False
     if f"libclang_rt.{sanitizer_type}.so" not in os.environ["LD_PRELOAD"]:
         return False
-    
+
     return True
 
 # -------------------- Launcher ----------------------------
@@ -116,7 +125,7 @@ extern "C" {{
 static void _launch(int gridX, int gridY, int gridZ, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
     // Cast "function" to the real function type.
-    // apply parallelization to the triton grid when using ThreadSanitizer (TSan) 
+    // apply parallelization to the triton grid when using ThreadSanitizer (TSan)
     // to help detect potential data races across program instances during kernel execution
     {"#pragma omp parallel for collapse(3)" if _get_sanitizer_type() == "tsan" else ""}
     for(int x = 0; x < gridX; x++) {{
@@ -282,7 +291,10 @@ def compile_module(launcher_src, kernel_placeholder_name):
         cache_path = cache.get_file(filename)
 
         if cache_path is None:
-          with tempfile.TemporaryDirectory() as tmpdir:
+            with tempfile.TemporaryDirectory(
+                dir=f"{get_triton_cache_path()}/_launcher_src",
+                delete=False,
+            ) as tmpdir:
               sanitizer_type = _get_sanitizer_type()
 
               if platform.system() == "Windows":
@@ -332,14 +344,16 @@ def compile_module(launcher_src, kernel_placeholder_name):
                           libomp_path = str(libomp_path.parent)
 
                           subprocess_args.extend(["-g", "-fsanitize=thread", "-fopenmp", f"-Wl,-rpath,{libomp_path}"])
-                      
+
                       subprocess.check_call(subprocess_args)
                   else:
                       subprocess.check_call([
                         "clang++", "-v", "-fuse-ld=lld",
                         "-std=c++17", launcher_src_path, obj_path,
                         f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
-                        "-shared", f"-l{py_lib}", "-fPIC", "-o", so_path
+                        "-shared",
+                        f"-l{py_lib}",
+                        "-fPIC", "-o", so_path
                       ])
 
               with open(so_path, "rb") as f:
@@ -460,7 +474,7 @@ class CPUDriver(DriverBase):
 
     def assemble_tensormap_to_arg(self, tensormaps_info, args):
         return args
-    
+
     def map_python_to_cpp_type(self, ty: str) -> str:
         return _ty_to_cpp(ty)
-  
+

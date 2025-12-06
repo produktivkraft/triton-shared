@@ -13,6 +13,14 @@ import functools
 import triton
 from pathlib import Path
 
+def get_triton_cache_path():
+    user_home = os.getenv("TRITON_HOME")
+    if not user_home:
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+    if not user_home:
+        raise RuntimeError("Could not find user home directory")
+    return os.path.join(user_home, ".triton")
+
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
     if path == "":
@@ -42,7 +50,7 @@ def _get_sanitizer_type():
     if sanitizer_type != "" and sanitizer_type != "asan" and sanitizer_type != "tsan":
         # throw error
         raise Exception(f"TRITON_SHARED_SANITIZER_TYPE {sanitizer_type} is invalid.")
-    
+
     return sanitizer_type
 
 def _ttir_to_ttsharedir(mod):
@@ -55,7 +63,17 @@ def _ttir_to_ttsharedir(mod):
         _dump_ir_if_needed([src_path])
         triton_shared_opt_path = _get_triton_shared_opt_path()
 
-        subprocess_args = [triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "--mlir-print-debuginfo", "-o", dst_path]
+        subprocess_args = [
+            triton_shared_opt_path,
+            src_path,
+            "--triton-to-linalg-experimental",
+            "--mlir-print-debuginfo",
+            "--mlir-print-ir-after-all",
+            "--mlir-print-ir-tree-dir",
+            f"{get_triton_cache_path()}/_ttir_to_ttsharedir",
+            "-o",
+            dst_path,
+        ]
 
         if _get_sanitizer_type() != "":
             print("Building with sanitizer support...")
@@ -145,7 +163,7 @@ def _llir_to_bin(llir: str, metadata):
             # using a sanitizer
             # invoke pass to append sanitizer attributes
             instrumented_src_path = os.path.join(tmpdir, "kernel-instrumented.ll")
-        
+
             opt_path = _get_llvm_bin_path("opt")
             top_level_triton_path = os.path.dirname(triton.__file__)
             sanitizer_attributes_pass_path = str(next(Path(top_level_triton_path).rglob("libSanitizerAttributes.so"), None))
@@ -153,8 +171,8 @@ def _llir_to_bin(llir: str, metadata):
             if not sanitizer_attributes_pass_path:
                 raise Exception(f"libSanitizerAttributes.so does not exist.")
 
-            subprocess.check_call([opt_path, "-load-pass-plugin", sanitizer_attributes_pass_path, 
-                "-passes=sanitizer-attributes", f"-sanitizer-type={sanitizer_type}", "-S", src_path, 
+            subprocess.check_call([opt_path, "-load-pass-plugin", sanitizer_attributes_pass_path,
+                "-passes=sanitizer-attributes", f"-sanitizer-type={sanitizer_type}", "-S", src_path,
                 "-o", instrumented_src_path])
 
             # compile to object file
@@ -166,12 +184,12 @@ def _llir_to_bin(llir: str, metadata):
                 subprocess_args.extend(["-g", "-fsanitize=address", "-mllvm", "-asan-stack=0"])
             elif sanitizer_type == "tsan":
                 subprocess_args.extend(["-g", "-fsanitize=thread"])
-                
+
             subprocess.check_call(subprocess_args)
         else:
             llc_path = _get_llvm_bin_path("llc")
             subprocess.check_call([llc_path, src_path, "-filetype=obj", "-relocation-model=pic", "-o", dst_path])
-        
+
         return Path(dst_path).read_bytes()
 
 
@@ -209,6 +227,8 @@ class CPUBackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
+        if os.environ.get("TRITON_MOCK_PTX_VERSION", None):
+            return False
         return target.backend == 'cpu'
 
     def __init__(self, target: GPUTarget) -> None:
